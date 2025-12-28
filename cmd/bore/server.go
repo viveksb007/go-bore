@@ -1,6 +1,10 @@
 package main
 
 import (
+	"os"
+	"os/signal"
+	"syscall"
+
 	"github.com/spf13/cobra"
 	"github.com/viveksb007/go-bore/internal/logging"
 	"github.com/viveksb007/go-bore/internal/server"
@@ -49,10 +53,26 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	srv := server.NewServer(serverPort, serverSecret)
 
-	if err := srv.Run(); err != nil {
-		logging.Error("server error", "error", err)
+	// Set up signal handling for graceful shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// Run the server in a goroutine
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Run()
+	}()
+
+	// Wait for either signal or server error
+	select {
+	case sig := <-sigCh:
+		logging.Info("received signal, shutting down", "signal", sig)
+		srv.Close()
+		return nil
+	case err := <-errCh:
+		if err != nil {
+			logging.Error("server error", "error", err)
+		}
 		return err
 	}
-
-	return nil
 }

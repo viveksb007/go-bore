@@ -73,6 +73,10 @@ func (s *Server) Run() error {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		logging.Error("failed to start server", "port", s.listenPort, "error", err)
+		// Check if port is already in use
+		if IsPortInUse(err) {
+			return NewPortInUseError(s.listenPort, err)
+		}
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
 	s.listener = listener
@@ -135,12 +139,14 @@ func (s *Server) handleControlConnection(conn net.Conn, handshakeMsg *protocol.M
 	handshake, err := protocol.DecodeHandshake(handshakeMsg.Payload)
 	if err != nil {
 		logging.Error("failed to decode handshake", "remoteAddr", remoteAddr, "error", err)
+		logging.Warn("protocol violation: malformed handshake", "remoteAddr", remoteAddr)
 		return
 	}
 
 	// Verify protocol version
 	if handshake.Version != protocol.ProtocolVersion {
 		logging.Error("unsupported protocol version", "version", handshake.Version, "remoteAddr", remoteAddr)
+		logging.Warn("protocol violation: unsupported version", "remoteAddr", remoteAddr, "version", handshake.Version)
 		s.sendReject(conn)
 		return
 	}
@@ -158,6 +164,7 @@ func (s *Server) handleControlConnection(conn net.Conn, handshakeMsg *protocol.M
 	publicPort, err := s.portAllocator.Allocate()
 	if err != nil {
 		logging.Error("failed to allocate port", "remoteAddr", remoteAddr, "error", err)
+		logging.Warn("resource exhausted: no available ports", "remoteAddr", remoteAddr)
 		s.sendReject(conn)
 		return
 	}
@@ -214,11 +221,20 @@ func (s *Server) handleDataConnection(conn net.Conn, streamHandshakeMsg *protoco
 	streamHandshake, err := protocol.DecodeStreamHandshake(streamHandshakeMsg.Payload)
 	if err != nil {
 		logging.Error("failed to decode stream handshake", "error", err)
+		logging.Warn("protocol violation: malformed stream handshake", "remoteAddr", conn.RemoteAddr())
 		conn.Close()
 		return
 	}
 
 	uuid := streamHandshake.UUID
+
+	// Validate UUID format (should be 36 characters)
+	if len(uuid) != 36 {
+		logging.Warn("protocol violation: invalid UUID format", "uuid", uuid, "remoteAddr", conn.RemoteAddr())
+		s.sendStreamReject(conn)
+		conn.Close()
+		return
+	}
 
 	// Look up UUID in pending streams
 	s.pendingMu.Lock()
@@ -553,10 +569,25 @@ func (s *Server) cleanupPendingStream(uuid string) {
 
 // Close shuts down the server and cleans up resources
 func (s *Server) Close() error {
+	logging.Debug("shutting down server")
+
 	// Close main listener first
 	if s.listener != nil {
 		s.listener.Close()
 	}
+
+	// Clean up all pending streams
+	s.pendingMu.Lock()
+	for uuid, pending := range s.pendingStreams {
+		if pending.timeout != nil {
+			pending.timeout.Stop()
+		}
+		if pending.externalConn != nil {
+			pending.externalConn.Close()
+		}
+		delete(s.pendingStreams, uuid)
+	}
+	s.pendingMu.Unlock()
 
 	// Clean up all client sessions
 	s.clientsMu.Lock()
@@ -570,6 +601,7 @@ func (s *Server) Close() error {
 		s.removeSession(id)
 	}
 
+	logging.Info("server shutdown complete")
 	return nil
 }
 

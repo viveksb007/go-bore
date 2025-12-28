@@ -955,7 +955,7 @@ func TestClientRunHandlesMalformedConnectPayload(t *testing.T) {
 		t.Fatal("Run() should fail with malformed connect payload")
 	}
 
-	expectedErr := "failed to decode connect message"
+	expectedErr := "malformed connect message"
 	if !containsSubstring(err.Error(), expectedErr) {
 		t.Errorf("Error should contain '%s', got: %v", expectedErr, err)
 	}

@@ -2,7 +2,10 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 
 	"github.com/spf13/cobra"
 	"github.com/viveksb007/go-bore/internal/client"
@@ -76,11 +79,27 @@ func runClient(cmd *cobra.Command, args []string) error {
 		"localPort", port,
 	)
 
-	// Run the client message loop
-	if err := c.Run(); err != nil {
-		logging.Error("client error", "error", err)
+	// Set up signal handling for graceful shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// Run the client message loop in a goroutine
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.Run()
+	}()
+
+	// Wait for either signal or client error
+	select {
+	case sig := <-sigCh:
+		logging.Info("received signal, shutting down", "signal", sig)
+		c.Close()
+		return nil
+	case err := <-errCh:
+		if err != nil {
+			logging.Error("client error", "error", err)
+		}
+		c.Close()
 		return err
 	}
-
-	return nil
 }

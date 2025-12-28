@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -65,6 +66,10 @@ func (c *Client) Connect() error {
 	conn, err := net.Dial("tcp", c.serverAddr)
 	if err != nil {
 		logging.Error("failed to connect to server", "server", c.serverAddr, "error", err)
+		// Check if it's a connection refused error
+		if isNetworkConnectionRefused(err) {
+			return NewConnectionRefusedError(c.serverAddr, err)
+		}
 		return fmt.Errorf("failed to connect to server %s: %w", c.serverAddr, err)
 	}
 	c.controlConn = conn
@@ -79,7 +84,7 @@ func (c *Client) Connect() error {
 		c.controlConn.Close()
 		c.controlConn = nil
 		logging.Error("handshake failed", "error", err)
-		return fmt.Errorf("handshake failed: %w", err)
+		return NewProtocolError("handshake", err.Error())
 	}
 
 	// Wait for accept/reject response
@@ -95,6 +100,22 @@ func (c *Client) Connect() error {
 	)
 
 	return nil
+}
+
+// isNetworkConnectionRefused checks if the error is a network-level connection refused
+func isNetworkConnectionRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		if opErr.Op == "dial" {
+			errStr := opErr.Err.Error()
+			return containsString(errStr, "connection refused") ||
+				containsString(errStr, "refused")
+		}
+	}
+	return containsString(err.Error(), "connection refused")
 }
 
 // sendHandshake sends the handshake message to the server
@@ -130,14 +151,18 @@ func (c *Client) sendHandshake() error {
 func (c *Client) receiveHandshakeResponse() error {
 	msg, err := protocol.ReadMessage(c.controlConn)
 	if err != nil {
-		return fmt.Errorf("failed to read server response: %w", err)
+		// Check if connection was closed
+		if errors.Is(err, io.EOF) || containsString(err.Error(), "EOF") {
+			return NewServerClosedError()
+		}
+		return NewProtocolError("receive_response", fmt.Sprintf("failed to read server response: %v", err))
 	}
 
 	switch msg.Type {
 	case protocol.MessageTypeAccept:
 		acceptPayload, err := protocol.DecodeAccept(msg.Payload)
 		if err != nil {
-			return fmt.Errorf("failed to decode accept message: %w", err)
+			return NewProtocolError("decode_accept", fmt.Sprintf("malformed accept message: %v", err))
 		}
 		c.publicPort = acceptPayload.PublicPort
 		c.serverHost = acceptPayload.ServerHost
@@ -149,10 +174,10 @@ func (c *Client) receiveHandshakeResponse() error {
 
 	case protocol.MessageTypeReject:
 		logging.Error("authentication failed")
-		return fmt.Errorf("authentication failed")
+		return NewAuthFailedError()
 
 	default:
-		return fmt.Errorf("unexpected message type: %d", msg.Type)
+		return NewProtocolError("handshake", fmt.Sprintf("unexpected message type: %d", msg.Type))
 	}
 }
 
@@ -161,7 +186,12 @@ func (c *Client) receiveHandshakeResponse() error {
 // This method blocks until the connection is closed or an error occurs.
 func (c *Client) Run() error {
 	if c.controlConn == nil {
-		return fmt.Errorf("client not connected, call Connect() first")
+		return &ClientError{
+			Op:       "run",
+			Err:      ErrNotConnected,
+			ExitCode: ExitCodeGenericError,
+			Message:  "client not connected, call Connect() first",
+		}
 	}
 
 	// Message reading loop
@@ -180,11 +210,16 @@ func (c *Client) Run() error {
 				return c.ctx.Err()
 			default:
 			}
-			return fmt.Errorf("failed to read message from server: %w", err)
+			// Check if connection was closed by server
+			if errors.Is(err, io.EOF) || containsString(err.Error(), "EOF") ||
+				containsString(err.Error(), "use of closed network connection") {
+				return NewServerClosedError()
+			}
+			return NewProtocolError("read_message", fmt.Sprintf("failed to read message from server: %v", err))
 		}
 
 		if err := c.handleMessage(msg); err != nil {
-			return fmt.Errorf("failed to handle message: %w", err)
+			return err
 		}
 	}
 }
@@ -196,7 +231,7 @@ func (c *Client) handleMessage(msg *protocol.Message) error {
 		// New external connection - spawn goroutine to handle it
 		connectPayload, err := protocol.DecodeConnect(msg.Payload)
 		if err != nil {
-			return fmt.Errorf("failed to decode connect message: %w", err)
+			return NewProtocolError("decode_connect", fmt.Sprintf("malformed connect message: %v", err))
 		}
 
 		// Spawn goroutine to handle the new stream
@@ -209,7 +244,7 @@ func (c *Client) handleMessage(msg *protocol.Message) error {
 		return nil
 
 	default:
-		return fmt.Errorf("unexpected message type in message loop: %d", msg.Type)
+		return NewProtocolError("message_loop", fmt.Sprintf("unexpected message type: %d", msg.Type))
 	}
 }
 
