@@ -69,7 +69,10 @@ func (c *Client) Connect() error {
 	}
 	c.controlConn = conn
 
-	logging.Debug("control connection established", "server", c.serverAddr)
+	logging.Info("control connection established",
+		"server", c.serverAddr,
+		"localAddr", conn.LocalAddr().String(),
+	)
 
 	// Send handshake message
 	if err := c.sendHandshake(); err != nil {
