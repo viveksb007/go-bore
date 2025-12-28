@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/viveksb007/go-bore/internal/logging"
 	"github.com/viveksb007/go-bore/internal/protocol"
 )
 
@@ -71,21 +72,26 @@ func (s *Server) Run() error {
 	addr := fmt.Sprintf(":%d", s.listenPort)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
+		logging.Error("failed to start server", "port", s.listenPort, "error", err)
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
 	s.listener = listener
 
-	fmt.Printf("Server listening on port %d\n", s.listenPort)
+	logging.Info("server listening", "port", s.listenPort)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			// If listener was closed, return nil (graceful shutdown)
 			if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
+				logging.Info("server stopped")
 				return nil
 			}
+			logging.Error("failed to accept connection", "error", err)
 			return fmt.Errorf("failed to accept connection: %w", err)
 		}
+
+		logging.Debug("new connection", "remoteAddr", conn.RemoteAddr())
 
 		// Handle client connection in a goroutine
 		go s.handleClient(conn)
@@ -98,7 +104,7 @@ func (s *Server) handleClient(conn net.Conn) {
 	// Read first message to determine connection type
 	msg, err := protocol.ReadMessage(conn)
 	if err != nil {
-		fmt.Printf("Failed to read first message: %v\n", err)
+		logging.Error("failed to read first message", "remoteAddr", conn.RemoteAddr(), "error", err)
 		conn.Close()
 		return
 	}
@@ -106,53 +112,59 @@ func (s *Server) handleClient(conn net.Conn) {
 	// Route based on message type
 	switch msg.Type {
 	case protocol.MessageTypeHandshake:
+		logging.Debug("control connection detected", "remoteAddr", conn.RemoteAddr())
 		// Control connection - we manage the lifecycle here
 		defer conn.Close()
 		s.handleControlConnection(conn, msg)
 	case protocol.MessageTypeStreamHandshake:
+		logging.Debug("data connection detected", "remoteAddr", conn.RemoteAddr())
 		// Data connection - proxyStream goroutine owns the connection lifecycle
 		// Do NOT close conn here; it will be closed by proxyStream when done
 		s.handleDataConnection(conn, msg)
 	default:
-		fmt.Printf("Unexpected message type %d from %s\n", msg.Type, conn.RemoteAddr())
+		logging.Error("unexpected message type", "type", msg.Type, "remoteAddr", conn.RemoteAddr())
 		conn.Close()
 	}
 }
 
 // handleControlConnection processes a control connection (client handshake)
 func (s *Server) handleControlConnection(conn net.Conn, handshakeMsg *protocol.Message) {
+	remoteAddr := conn.RemoteAddr().String()
+
 	// Decode handshake payload
 	handshake, err := protocol.DecodeHandshake(handshakeMsg.Payload)
 	if err != nil {
-		fmt.Printf("Failed to decode handshake: %v\n", err)
+		logging.Error("failed to decode handshake", "remoteAddr", remoteAddr, "error", err)
 		return
 	}
 
 	// Verify protocol version
 	if handshake.Version != protocol.ProtocolVersion {
-		fmt.Printf("Unsupported protocol version: %d\n", handshake.Version)
+		logging.Error("unsupported protocol version", "version", handshake.Version, "remoteAddr", remoteAddr)
 		s.sendReject(conn)
 		return
 	}
 
 	// Authenticate
 	if !s.authenticate(handshake.Secret) {
-		fmt.Printf("Authentication failed for client %s\n", conn.RemoteAddr())
+		logging.Warn("authentication failed", "remoteAddr", remoteAddr)
 		s.sendReject(conn)
 		return
 	}
 
+	logging.Debug("client authenticated", "remoteAddr", remoteAddr)
+
 	// Allocate public port
 	publicPort, err := s.portAllocator.Allocate()
 	if err != nil {
-		fmt.Printf("Failed to allocate port: %v\n", err)
+		logging.Error("failed to allocate port", "remoteAddr", remoteAddr, "error", err)
 		s.sendReject(conn)
 		return
 	}
 
 	// Send accept message
 	if err := s.sendAccept(conn, publicPort); err != nil {
-		fmt.Printf("Failed to send accept message: %v\n", err)
+		logging.Error("failed to send accept message", "remoteAddr", remoteAddr, "error", err)
 		s.portAllocator.Release(publicPort)
 		return
 	}
@@ -164,14 +176,17 @@ func (s *Server) handleControlConnection(conn net.Conn, handshakeMsg *protocol.M
 	// Create listener on public port
 	publicListener, err := s.createPublicListener(publicPort)
 	if err != nil {
-		fmt.Printf("Failed to create public listener on port %d: %v\n", publicPort, err)
+		logging.Error("failed to create public listener", "port", publicPort, "remoteAddr", remoteAddr, "error", err)
 		s.portAllocator.Release(publicPort)
 		s.removeSession(session.id)
 		return
 	}
 	session.listener = publicListener
 
-	fmt.Printf("Client %s authenticated, allocated port %d\n", session.id, publicPort)
+	logging.Info("client connected",
+		"sessionID", session.id,
+		"publicPort", publicPort,
+	)
 
 	// Start accepting connections on public port
 	go s.acceptPublicConnections(session)
@@ -184,6 +199,7 @@ func (s *Server) handleControlConnection(conn net.Conn, handshakeMsg *protocol.M
 		_, err := conn.Read(buf)
 		if err != nil {
 			// Connection closed
+			logging.Info("client disconnected", "sessionID", session.id)
 			s.removeSession(session.id)
 			return
 		}
@@ -197,7 +213,7 @@ func (s *Server) handleDataConnection(conn net.Conn, streamHandshakeMsg *protoco
 	// Decode stream handshake payload
 	streamHandshake, err := protocol.DecodeStreamHandshake(streamHandshakeMsg.Payload)
 	if err != nil {
-		fmt.Printf("Failed to decode stream handshake: %v\n", err)
+		logging.Error("failed to decode stream handshake", "error", err)
 		conn.Close()
 		return
 	}
@@ -209,7 +225,7 @@ func (s *Server) handleDataConnection(conn net.Conn, streamHandshakeMsg *protoco
 	pending, exists := s.pendingStreams[uuid]
 	if !exists {
 		s.pendingMu.Unlock()
-		fmt.Printf("Stream UUID %s not found or expired\n", uuid)
+		logging.Warn("stream UUID not found or expired", "uuid", uuid)
 		s.sendStreamReject(conn)
 		conn.Close()
 		return
@@ -226,7 +242,7 @@ func (s *Server) handleDataConnection(conn net.Conn, streamHandshakeMsg *protoco
 
 	// Send stream accept
 	if err := s.sendStreamAccept(conn); err != nil {
-		fmt.Printf("Failed to send stream accept for UUID %s: %v\n", uuid, err)
+		logging.Error("failed to send stream accept", "uuid", uuid, "error", err)
 		// Close both connections on error
 		conn.Close()
 		pending.externalConn.Close()
@@ -245,7 +261,7 @@ func (s *Server) handleDataConnection(conn net.Conn, streamHandshakeMsg *protoco
 	s.clientsMu.RUnlock()
 
 	if session == nil {
-		fmt.Printf("Client session %s not found for UUID %s\n", pending.sessionID, uuid)
+		logging.Error("client session not found", "sessionID", pending.sessionID, "uuid", uuid)
 		conn.Close()
 		pending.externalConn.Close()
 		return
@@ -265,10 +281,13 @@ func (s *Server) handleDataConnection(conn net.Conn, streamHandshakeMsg *protoco
 	session.streams[uuid] = stream
 	session.streamsMu.Unlock()
 
-	fmt.Printf("Stream %s established for session %s\n", uuid, session.id)
+	logging.Info("stream created",
+		"uuid", uuid,
+		"sessionID", session.id,
+	)
 
 	// Start bidirectional raw TCP proxy
-	fmt.Printf("Starting proxy for stream %s\n", uuid)
+	logging.Debug("starting proxy", "uuid", uuid)
 	go s.proxyStream(stream, session)
 }
 
@@ -438,12 +457,21 @@ func (s *Server) acceptPublicConnections(session *ClientSession) {
 			if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
 				return
 			}
-			fmt.Printf("Failed to accept connection on public port %d: %v\n", session.publicPort, err)
+			logging.Error("failed to accept connection on public port",
+				"port", session.publicPort,
+				"error", err,
+			)
 			return
 		}
 
 		// Generate UUID for this connection
 		streamUUID := uuid.New().String()
+
+		logging.Debug("new external connection",
+			"port", session.publicPort,
+			"uuid", streamUUID,
+			"remoteAddr", conn.RemoteAddr(),
+		)
 
 		// Create pending stream with timeout
 		pending := &PendingStream{
@@ -464,14 +492,15 @@ func (s *Server) acceptPublicConnections(session *ClientSession) {
 
 		// Send MessageTypeConnect to client
 		if err := s.sendConnect(session, streamUUID); err != nil {
-			fmt.Printf("Failed to send connect message for UUID %s: %v\n", streamUUID, err)
+			logging.Error("failed to send connect message",
+				"uuid", streamUUID,
+				"error", err,
+			)
 			s.cleanupPendingStream(streamUUID)
 			continue
 		}
 
-		fmt.Printf("New external connection on port %d, assigned UUID %s\n", session.publicPort, streamUUID)
-
-		// TODO: Client will open data connection with this UUID in task 6
+		logging.Debug("connect message sent", "uuid", streamUUID)
 	}
 }
 
@@ -519,7 +548,7 @@ func (s *Server) cleanupPendingStream(uuid string) {
 		pending.externalConn.Close()
 	}
 
-	fmt.Printf("Cleaned up pending stream %s (timeout or error)\n", uuid)
+	logging.Debug("pending stream cleaned up", "uuid", uuid)
 }
 
 // Close shuts down the server and cleans up resources
@@ -544,9 +573,18 @@ func (s *Server) Close() error {
 	return nil
 }
 
+// Addr returns the server's listen address as a string.
+// Returns empty string if server is not running.
+func (s *Server) Addr() string {
+	if s.listener == nil {
+		return ""
+	}
+	return s.listener.Addr().String()
+}
+
 // proxyStream handles bidirectional raw TCP proxying for a stream
 func (s *Server) proxyStream(stream *ServerStream, session *ClientSession) {
-	fmt.Printf("Proxy started for stream %s\n", stream.uuid)
+	logging.Debug("proxy started", "uuid", stream.uuid)
 	defer func() {
 		// Clean up stream when proxy exits
 		s.cleanupStream(stream, session)
@@ -557,12 +595,12 @@ func (s *Server) proxyStream(stream *ServerStream, session *ClientSession) {
 
 	// Goroutine 1: external → client (externalConn → dataConn)
 	go func() {
-		fmt.Printf("Stream %s: starting external→client copy\n", stream.uuid)
+		logging.Debug("starting external→client copy", "uuid", stream.uuid)
 		_, err := io.Copy(stream.dataConn, stream.externalConn)
 		if err != nil {
-			fmt.Printf("Stream %s: external→client copy error: %v\n", stream.uuid, err)
+			logging.Debug("external→client copy error", "uuid", stream.uuid, "error", err)
 		} else {
-			fmt.Printf("Stream %s: external→client copy completed\n", stream.uuid)
+			logging.Debug("external→client copy completed", "uuid", stream.uuid)
 		}
 
 		// Signal completion and close connections
@@ -576,12 +614,12 @@ func (s *Server) proxyStream(stream *ServerStream, session *ClientSession) {
 
 	// Goroutine 2: client → external (dataConn → externalConn)
 	go func() {
-		fmt.Printf("Stream %s: starting client→external copy\n", stream.uuid)
+		logging.Debug("starting client→external copy", "uuid", stream.uuid)
 		_, err := io.Copy(stream.externalConn, stream.dataConn)
 		if err != nil {
-			fmt.Printf("Stream %s: client→external copy error: %v\n", stream.uuid, err)
+			logging.Debug("client→external copy error", "uuid", stream.uuid, "error", err)
 		} else {
-			fmt.Printf("Stream %s: client→external copy completed\n", stream.uuid)
+			logging.Debug("client→external copy completed", "uuid", stream.uuid)
 		}
 
 		// Signal completion and close connections
@@ -598,7 +636,7 @@ func (s *Server) proxyStream(stream *ServerStream, session *ClientSession) {
 	stream.dataConn.Close()
 	stream.externalConn.Close()
 
-	fmt.Printf("Stream %s: bidirectional proxy completed\n", stream.uuid)
+	logging.Debug("bidirectional proxy completed", "uuid", stream.uuid)
 }
 
 // cleanupStream removes a stream from the session and closes resources
@@ -611,5 +649,5 @@ func (s *Server) cleanupStream(stream *ServerStream, session *ClientSession) {
 	// Close stream resources
 	stream.close()
 
-	fmt.Printf("Stream %s cleaned up\n", stream.uuid)
+	logging.Info("stream closed", "uuid", stream.uuid)
 }
