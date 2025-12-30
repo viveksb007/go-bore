@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gobore-server
+  labels:
+    app: gobore-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gobore-server
+  template:
+    metadata:
+      labels:
+        app: gobore-server
+    spec:
+      containers:
+      - name: gobore-server
+        image: 144465910773.dkr.ecr.us-west-2.amazonaws.com/my-dev/gobore-server:latest
+        ports:
+        - containerPort: 7835
+          protocol: TCP
+        - containerPort: 80
+          protocol: TCP
+        args:
+        - "server"
+        - "--port"
+        - "7835"
+        - "--health-port"
+        - "80"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 80
+          initialDelaySeconds: 3
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gobore-server
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "80"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: "/health"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: "HTTP"
+spec:
+  type: LoadBalancer
+  selector:
+    app: gobore-server
+  ports:
+  - name: bore
+    port: 7835
+    targetPort: 7835
+    protocol: TCP
+  - name: health
+    port: 80
+    targetPort: 80
+    protocol: TCP

@@ -11,8 +11,9 @@ import (
 )
 
 var (
-	serverPort   int
-	serverSecret string
+	serverPort      int
+	serverSecret    string
+	healthCheckPort int
 )
 
 // serverCmd represents the server command
@@ -33,6 +34,7 @@ func init() {
 
 	serverCmd.Flags().IntVarP(&serverPort, "port", "p", 7835, "Port to listen for client connections")
 	serverCmd.Flags().StringVarP(&serverSecret, "secret", "s", "", "Secret for client authentication")
+	serverCmd.Flags().IntVar(&healthCheckPort, "health-port", 0, "Port for health check HTTP server (0 to disable)")
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
@@ -51,6 +53,16 @@ func runServer(cmd *cobra.Command, args []string) error {
 		logging.SecretAttr("secret", serverSecret),
 	)
 
+	// Start health check server if port is specified
+	var healthServer *server.HealthServer
+	if healthCheckPort > 0 {
+		healthServer = server.NewHealthServer(healthCheckPort)
+		if err := healthServer.Start(); err != nil {
+			logging.Error("failed to start health check server", "error", err)
+			return err
+		}
+	}
+
 	srv := server.NewServer(serverPort, serverSecret)
 
 	// Set up signal handling for graceful shutdown
@@ -67,11 +79,17 @@ func runServer(cmd *cobra.Command, args []string) error {
 	select {
 	case sig := <-sigCh:
 		logging.Info("received signal, shutting down", "signal", sig)
+		if healthServer != nil {
+			healthServer.Stop()
+		}
 		srv.Close()
 		return nil
 	case err := <-errCh:
 		if err != nil {
 			logging.Error("server error", "error", err)
+		}
+		if healthServer != nil {
+			healthServer.Stop()
 		}
 		return err
 	}
