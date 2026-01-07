@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 )
 
 // Exit codes for client errors
@@ -189,15 +190,5 @@ func isConnectionRefusedSyscall(err error) bool {
 		return false
 	}
 	// Check error message for "connection refused" as a fallback
-	return containsString(err.Error(), "connection refused")
-}
-
-// containsString checks if s contains substr
-func containsString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
+	return strings.Contains(err.Error(), "connection refused")
 }

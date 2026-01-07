@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 )
 
 // Exit codes for server errors
@@ -111,10 +112,10 @@ func IsPortInUse(err error) bool {
 	// Check for network-level address in use
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
-		return containsString(opErr.Err.Error(), "address already in use")
+		return strings.Contains(opErr.Err.Error(), "address already in use")
 	}
 
-	return containsString(err.Error(), "address already in use")
+	return strings.Contains(err.Error(), "address already in use")
 }
 
 // IsPortAllocationFailed checks if the error is a port allocation failure
@@ -150,14 +151,4 @@ func GetExitCode(err error) int {
 	}
 
 	return ExitCodeGenericError
-}
-
-// containsString checks if s contains substr
-func containsString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -112,11 +113,11 @@ func isNetworkConnectionRefused(err error) bool {
 	if errors.As(err, &opErr) {
 		if opErr.Op == "dial" {
 			errStr := opErr.Err.Error()
-			return containsString(errStr, "connection refused") ||
-				containsString(errStr, "refused")
+			return strings.Contains(errStr, "connection refused") ||
+				strings.Contains(errStr, "refused")
 		}
 	}
-	return containsString(err.Error(), "connection refused")
+	return strings.Contains(err.Error(), "connection refused")
 }
 
 // sendHandshake sends the handshake message to the server
@@ -153,7 +154,7 @@ func (c *Client) receiveHandshakeResponse() error {
 	msg, err := protocol.ReadMessage(c.controlConn)
 	if err != nil {
 		// Check if connection was closed
-		if errors.Is(err, io.EOF) || containsString(err.Error(), "EOF") {
+		if errors.Is(err, io.EOF) || strings.Contains(err.Error(), "EOF") {
 			return NewServerClosedError()
 		}
 		return NewProtocolError("receive_response", fmt.Sprintf("failed to read server response: %v", err))
@@ -212,8 +213,8 @@ func (c *Client) Run() error {
 			default:
 			}
 			// Check if connection was closed by server
-			if errors.Is(err, io.EOF) || containsString(err.Error(), "EOF") ||
-				containsString(err.Error(), "use of closed network connection") {
+			if errors.Is(err, io.EOF) || strings.Contains(err.Error(), "EOF") ||
+				strings.Contains(err.Error(), "use of closed network connection") {
 				return NewServerClosedError()
 			}
 			return NewProtocolError("read_message", fmt.Sprintf("failed to read message from server: %v", err))
