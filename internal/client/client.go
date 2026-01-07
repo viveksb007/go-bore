@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -323,7 +324,7 @@ func (c *Client) handleNewStream(uuid string) {
 	}
 
 	// Step 4: Dial local service
-	localAddr := fmt.Sprintf("%s:%d", c.localHost, c.localPort)
+	localAddr := net.JoinHostPort(c.localHost, strconv.Itoa(c.localPort))
 	localConn, err := net.DialTimeout("tcp", localAddr, 10*time.Second)
 	if err != nil {
 		logging.Error("failed to connect to local service", "uuid", uuid, "localAddr", localAddr, "error", err)
