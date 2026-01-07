@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"net"
@@ -314,8 +315,8 @@ func (s *Server) authenticate(clientSecret string) bool {
 		return true
 	}
 
-	// Otherwise, require exact match
-	return clientSecret == s.secret
+	// Use constant-time comparison to prevent timing attacks
+	return subtle.ConstantTimeCompare([]byte(clientSecret), []byte(s.secret)) == 1
 }
 
 // sendAccept sends an accept message to the client
