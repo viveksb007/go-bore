@@ -15,149 +15,296 @@ import (
 	"github.com/viveksb007/go-bore/internal/server"
 )
 
-// TestEndToEndHTTPTunneling tests complete HTTP tunneling through bore.
-// Requirements: 3.1, 3.2, 4.3
-func TestEndToEndHTTPTunneling(t *testing.T) {
-	// Step 1: Start a local HTTP test server
-	localServer := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "text/plain")
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintf(w, "Hello from local server! Path: %s", r.URL.Path)
-		}),
+// IntegrationEnv provides a reusable test environment for integration tests.
+type IntegrationEnv struct {
+	Server     *server.Server
+	t          *testing.T
+	serverDone chan error
+}
+
+// IntegrationEnvConfig holds configuration for the integration test environment.
+type IntegrationEnvConfig struct {
+	Port   int
+	Secret string
+}
+
+// NewIntegrationEnv creates and starts a new integration test environment.
+func NewIntegrationEnv(t *testing.T, cfg *IntegrationEnvConfig) *IntegrationEnv {
+	t.Helper()
+
+	if cfg == nil {
+		cfg = &IntegrationEnvConfig{Port: 8081}
+	}
+	if cfg.Port == 0 {
+		cfg.Port = 8081
 	}
 
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
+	srv := server.NewServer(cfg.Port, cfg.Secret)
+	env := &IntegrationEnv{
+		Server:     srv,
+		t:          t,
+		serverDone: make(chan error, 1),
+	}
+
+	go func() {
+		env.serverDone <- srv.Run()
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	if srv.Addr() == "" {
+		t.Fatal("Server failed to start")
+	}
+
+	return env
+}
+
+// Stop shuts down the integration test environment.
+func (env *IntegrationEnv) Stop() {
+	env.Server.Close()
+}
+
+// ServerAddr returns the server's listen address.
+func (env *IntegrationEnv) ServerAddr() string {
+	return env.Server.Addr()
+}
+
+// ConnectClient creates and connects a bore client to the server.
+func (env *IntegrationEnv) ConnectClient(localPort int, secret string) *ConnectedBoreClient {
+	env.t.Helper()
+
+	c := client.NewClient(env.ServerAddr(), localPort, "127.0.0.1", secret)
+	if err := c.Connect(); err != nil {
+		env.t.Fatalf("Client failed to connect: %v", err)
+	}
+
+	clientDone := make(chan error, 1)
+	go func() {
+		clientDone <- c.Run()
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	return &ConnectedBoreClient{
+		Client:     c,
+		clientDone: clientDone,
+		env:        env,
+	}
+}
+
+// ConnectedBoreClient represents a connected bore client.
+type ConnectedBoreClient struct {
+	Client     *client.Client
+	clientDone chan error
+	env        *IntegrationEnv
+}
+
+// Close closes the bore client.
+func (c *ConnectedBoreClient) Close() {
+	c.Client.Close()
+}
+
+// PublicPort returns the client's public port.
+func (c *ConnectedBoreClient) PublicPort() uint16 {
+	return c.Client.PublicPort()
+}
+
+// ConnectThroughTunnel connects to the public port and returns the connection.
+func (c *ConnectedBoreClient) ConnectThroughTunnel() net.Conn {
+	c.env.t.Helper()
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", c.PublicPort()))
+	if err != nil {
+		c.env.t.Fatalf("Failed to connect through tunnel: %v", err)
+	}
+	return conn
+}
+
+// LocalEchoServer represents a local TCP echo server for testing.
+type LocalEchoServer struct {
+	Listener net.Listener
+	Port     int
+}
+
+// NewLocalEchoServer creates and starts a local echo server.
+func NewLocalEchoServer(t *testing.T) *LocalEchoServer {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Failed to create local listener: %v", err)
 	}
-	localPort := localListener.Addr().(*net.TCPAddr).Port
 
-	go localServer.Serve(localListener)
-	defer localServer.Close()
-
-	// Step 2: Start bore server
-	boreServer := server.NewServer(0, "")
-	serverErrCh := make(chan error, 1)
-	go func() {
-		serverErrCh <- boreServer.Run()
-	}()
-	defer boreServer.Close()
-
-	// Wait for server to start
-	time.Sleep(100 * time.Millisecond)
-
-	serverAddr := boreServer.Addr()
-	if serverAddr == "" {
-		t.Fatal("Server address is empty")
+	srv := &LocalEchoServer{
+		Listener: listener,
+		Port:     listener.Addr().(*net.TCPAddr).Port,
 	}
 
-	// Step 3: Start bore client
-	boreClient := client.NewClient(serverAddr, localPort, "127.0.0.1", "")
-	if err := boreClient.Connect(); err != nil {
-		t.Fatalf("Client failed to connect: %v", err)
-	}
-	defer boreClient.Close()
-
-	// Start client message loop in goroutine
-	clientErrCh := make(chan error, 1)
 	go func() {
-		clientErrCh <- boreClient.Run()
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.Copy(c, c)
+			}(conn)
+		}
 	}()
 
-	publicPort := boreClient.PublicPort()
-	if publicPort == 0 {
+	return srv
+}
+
+// Close closes the echo server.
+func (s *LocalEchoServer) Close() {
+	s.Listener.Close()
+}
+
+// LocalHTTPServer represents a local HTTP server for testing.
+type LocalHTTPServer struct {
+	Server   *http.Server
+	Listener net.Listener
+	Port     int
+}
+
+// NewLocalHTTPServer creates and starts a local HTTP server.
+func NewLocalHTTPServer(t *testing.T, handler http.Handler) *LocalHTTPServer {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to create local listener: %v", err)
+	}
+
+	srv := &LocalHTTPServer{
+		Server:   &http.Server{Handler: handler},
+		Listener: listener,
+		Port:     listener.Addr().(*net.TCPAddr).Port,
+	}
+
+	go srv.Server.Serve(listener)
+
+	return srv
+}
+
+// Close closes the HTTP server.
+func (s *LocalHTTPServer) Close() {
+	s.Server.Close()
+}
+
+// LocalCustomServer represents a local server with custom connection handling.
+type LocalCustomServer struct {
+	Listener net.Listener
+	Port     int
+}
+
+// NewLocalCustomServer creates a local server with custom handler.
+func NewLocalCustomServer(t *testing.T, handler func(net.Conn)) *LocalCustomServer {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to create local listener: %v", err)
+	}
+
+	srv := &LocalCustomServer{
+		Listener: listener,
+		Port:     listener.Addr().(*net.TCPAddr).Port,
+	}
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go handler(conn)
+		}
+	}()
+
+	return srv
+}
+
+// Close closes the custom server.
+func (s *LocalCustomServer) Close() {
+	s.Listener.Close()
+}
+
+// containsString checks if s contains substr.
+func containsString(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+// ============================================================================
+// End-to-End Tests
+// ============================================================================
+
+// TestEndToEndHTTPTunneling tests complete HTTP tunneling through bore.
+func TestEndToEndHTTPTunneling(t *testing.T) {
+	localHTTP := NewLocalHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Hello from local server! Path: %s", r.URL.Path)
+	}))
+	defer localHTTP.Close()
+
+	env := NewIntegrationEnv(t, nil)
+	defer env.Stop()
+
+	client := env.ConnectClient(localHTTP.Port, "")
+	defer client.Close()
+
+	if client.PublicPort() == 0 {
 		t.Fatal("Public port is 0")
 	}
 
-	// Give time for everything to be ready
-	time.Sleep(100 * time.Millisecond)
-
-	// Step 4: Make HTTP request through tunnel
-	tunnelURL := fmt.Sprintf("http://127.0.0.1:%d/test-path", publicPort)
+	// Make HTTP request through tunnel
+	tunnelURL := fmt.Sprintf("http://127.0.0.1:%d/test-path", client.PublicPort())
 	resp, err := http.Get(tunnelURL)
 	if err != nil {
 		t.Fatalf("HTTP request through tunnel failed: %v", err)
 	}
 	defer resp.Body.Close()
 
-	// Step 5: Verify response
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("Failed to read response body: %v", err)
-	}
-
+	body, _ := io.ReadAll(resp.Body)
 	expectedBody := "Hello from local server! Path: /test-path"
 	if string(body) != expectedBody {
 		t.Errorf("Response body mismatch.\nExpected: %s\nGot: %s", expectedBody, string(body))
 	}
 
 	// Verify direct connection gives same result
-	directURL := fmt.Sprintf("http://127.0.0.1:%d/test-path", localPort)
-	directResp, err := http.Get(directURL)
-	if err != nil {
-		t.Fatalf("Direct HTTP request failed: %v", err)
-	}
+	directURL := fmt.Sprintf("http://127.0.0.1:%d/test-path", localHTTP.Port)
+	directResp, _ := http.Get(directURL)
 	defer directResp.Body.Close()
-
 	directBody, _ := io.ReadAll(directResp.Body)
+
 	if string(body) != string(directBody) {
-		t.Errorf("Tunnel response differs from direct response.\nTunnel: %s\nDirect: %s", body, directBody)
+		t.Errorf("Tunnel response differs from direct response")
 	}
 }
 
 // TestEndToEndTCPDataIntegrity tests that data is preserved exactly through the tunnel.
-// Requirements: 3.1, 3.2
 func TestEndToEndTCPDataIntegrity(t *testing.T) {
-	// Start a local TCP echo server
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to create local listener: %v", err)
-	}
-	defer localListener.Close()
-	localPort := localListener.Addr().(*net.TCPAddr).Port
+	localEcho := NewLocalEchoServer(t)
+	defer localEcho.Close()
 
-	// Echo server goroutine
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				io.Copy(c, c) // Echo back everything
-			}(conn)
-		}
-	}()
+	env := NewIntegrationEnv(t, nil)
+	defer env.Stop()
 
-	// Start bore server
-	boreServer := server.NewServer(0, "")
-	go boreServer.Run()
-	defer boreServer.Close()
-	time.Sleep(100 * time.Millisecond)
+	client := env.ConnectClient(localEcho.Port, "")
+	defer client.Close()
 
-	// Start bore client
-	boreClient := client.NewClient(boreServer.Addr(), localPort, "127.0.0.1", "")
-	if err := boreClient.Connect(); err != nil {
-		t.Fatalf("Client failed to connect: %v", err)
-	}
-	defer boreClient.Close()
-
-	go boreClient.Run()
-	time.Sleep(100 * time.Millisecond)
-
-	publicPort := boreClient.PublicPort()
-
-	// Connect through tunnel and test data integrity
-	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
-	if err != nil {
-		t.Fatalf("Failed to connect through tunnel: %v", err)
-	}
+	conn := client.ConnectThroughTunnel()
 	defer conn.Close()
 
 	// Test various data patterns
@@ -168,19 +315,17 @@ func TestEndToEndTCPDataIntegrity(t *testing.T) {
 		make([]byte, 8192), // 8KB of data
 	}
 
-	// Fill larger test cases with pattern
+	// Fill larger test case with pattern
 	for i := range testCases[3] {
 		testCases[3][i] = byte(i % 256)
 	}
 
 	for i, testData := range testCases {
-		// Send data
 		_, err := conn.Write(testData)
 		if err != nil {
 			t.Fatalf("Test case %d: Failed to write: %v", i, err)
 		}
 
-		// Read response
 		response := make([]byte, len(testData))
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		_, err = io.ReadFull(conn, response)
@@ -188,11 +333,9 @@ func TestEndToEndTCPDataIntegrity(t *testing.T) {
 			t.Fatalf("Test case %d: Failed to read: %v", i, err)
 		}
 
-		// Verify data integrity
 		for j := range testData {
 			if testData[j] != response[j] {
-				t.Errorf("Test case %d: Data mismatch at byte %d. Expected %d, got %d",
-					i, j, testData[j], response[j])
+				t.Errorf("Test case %d: Data mismatch at byte %d", i, j)
 				break
 			}
 		}
@@ -200,55 +343,26 @@ func TestEndToEndTCPDataIntegrity(t *testing.T) {
 }
 
 // TestEndToEndBidirectionalData tests bidirectional data flow.
-// Requirements: 3.1, 3.2, 4.3
 func TestEndToEndBidirectionalData(t *testing.T) {
-	// Start a local server that sends data and receives response
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to create local listener: %v", err)
-	}
-	defer localListener.Close()
-	localPort := localListener.Addr().(*net.TCPAddr).Port
-
 	serverReceived := make(chan []byte, 1)
 	serverToSend := []byte("Server says hello!")
 
-	go func() {
-		conn, err := localListener.Accept()
-		if err != nil {
-			return
-		}
+	localSrv := NewLocalCustomServer(t, func(conn net.Conn) {
 		defer conn.Close()
-
-		// Send data to client
 		conn.Write(serverToSend)
-
-		// Read data from client
 		buf := make([]byte, 1024)
 		n, _ := conn.Read(buf)
 		serverReceived <- buf[:n]
-	}()
+	})
+	defer localSrv.Close()
 
-	// Start bore server and client
-	boreServer := server.NewServer(0, "")
-	go boreServer.Run()
-	defer boreServer.Close()
-	time.Sleep(100 * time.Millisecond)
+	env := NewIntegrationEnv(t, nil)
+	defer env.Stop()
 
-	boreClient := client.NewClient(boreServer.Addr(), localPort, "127.0.0.1", "")
-	if err := boreClient.Connect(); err != nil {
-		t.Fatalf("Client failed to connect: %v", err)
-	}
-	defer boreClient.Close()
+	client := env.ConnectClient(localSrv.Port, "")
+	defer client.Close()
 
-	go boreClient.Run()
-	time.Sleep(100 * time.Millisecond)
-
-	// Connect through tunnel
-	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", boreClient.PublicPort()))
-	if err != nil {
-		t.Fatalf("Failed to connect through tunnel: %v", err)
-	}
+	conn := client.ConnectThroughTunnel()
 	defer conn.Close()
 
 	// Read data from server
@@ -267,7 +381,6 @@ func TestEndToEndBidirectionalData(t *testing.T) {
 	clientToSend := []byte("Client says hi!")
 	conn.Write(clientToSend)
 
-	// Verify server received it
 	select {
 	case received := <-serverReceived:
 		if string(received) != string(clientToSend) {
@@ -278,65 +391,40 @@ func TestEndToEndBidirectionalData(t *testing.T) {
 	}
 }
 
-// TestMultipleConcurrentConnections tests that multiple external connections work simultaneously.
-// Requirements: 4.1, 4.2
-func TestMultipleConcurrentConnections(t *testing.T) {
-	// Start a local server that handles multiple connections
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to create local listener: %v", err)
-	}
-	defer localListener.Close()
-	localPort := localListener.Addr().(*net.TCPAddr).Port
+// ============================================================================
+// Concurrent Connection Tests
+// ============================================================================
 
-	// Local server that echoes with connection ID
+// TestMultipleConcurrentConnections tests that multiple external connections work simultaneously.
+func TestMultipleConcurrentConnections(t *testing.T) {
 	var connCounter int
 	var counterMu sync.Mutex
-	go func() {
+
+	localSrv := NewLocalCustomServer(t, func(conn net.Conn) {
+		defer conn.Close()
+		counterMu.Lock()
+		connCounter++
+		connID := connCounter
+		counterMu.Unlock()
+
+		buf := make([]byte, 1024)
 		for {
-			conn, err := localListener.Accept()
+			n, err := conn.Read(buf)
 			if err != nil {
 				return
 			}
-			counterMu.Lock()
-			connCounter++
-			connID := connCounter
-			counterMu.Unlock()
-
-			go func(c net.Conn, id int) {
-				defer c.Close()
-				buf := make([]byte, 1024)
-				for {
-					n, err := c.Read(buf)
-					if err != nil {
-						return
-					}
-					// Echo back with connection ID prefix
-					response := fmt.Sprintf("conn%d:%s", id, buf[:n])
-					c.Write([]byte(response))
-				}
-			}(conn, connID)
+			response := fmt.Sprintf("conn%d:%s", connID, buf[:n])
+			conn.Write([]byte(response))
 		}
-	}()
+	})
+	defer localSrv.Close()
 
-	// Start bore server and client
-	boreServer := server.NewServer(0, "")
-	go boreServer.Run()
-	defer boreServer.Close()
-	time.Sleep(100 * time.Millisecond)
+	env := NewIntegrationEnv(t, nil)
+	defer env.Stop()
 
-	boreClient := client.NewClient(boreServer.Addr(), localPort, "127.0.0.1", "")
-	if err := boreClient.Connect(); err != nil {
-		t.Fatalf("Client failed to connect: %v", err)
-	}
-	defer boreClient.Close()
+	client := env.ConnectClient(localSrv.Port, "")
+	defer client.Close()
 
-	go boreClient.Run()
-	time.Sleep(100 * time.Millisecond)
-
-	publicPort := boreClient.PublicPort()
-
-	// Create multiple concurrent connections
 	numConnections := 5
 	var wg sync.WaitGroup
 	errors := make(chan error, numConnections)
@@ -347,22 +435,16 @@ func TestMultipleConcurrentConnections(t *testing.T) {
 		go func(connNum int) {
 			defer wg.Done()
 
-			conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
+			conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", client.PublicPort()))
 			if err != nil {
 				errors <- fmt.Errorf("connection %d: failed to connect: %v", connNum, err)
 				return
 			}
 			defer conn.Close()
 
-			// Send unique data
 			msg := fmt.Sprintf("hello%d", connNum)
-			_, err = conn.Write([]byte(msg))
-			if err != nil {
-				errors <- fmt.Errorf("connection %d: failed to write: %v", connNum, err)
-				return
-			}
+			conn.Write([]byte(msg))
 
-			// Read response
 			buf := make([]byte, 1024)
 			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			n, err := conn.Read(buf)
@@ -379,16 +461,13 @@ func TestMultipleConcurrentConnections(t *testing.T) {
 	close(errors)
 	close(results)
 
-	// Check for errors
 	for err := range errors {
 		t.Error(err)
 	}
 
-	// Verify all connections got responses
 	responseCount := 0
 	for result := range results {
 		responseCount++
-		// Each response should contain "conn" prefix and the original message
 		if len(result) < 5 || result[:4] != "conn" {
 			t.Errorf("Unexpected response format: %s", result)
 		}
@@ -400,64 +479,34 @@ func TestMultipleConcurrentConnections(t *testing.T) {
 }
 
 // TestConcurrentConnectionsDataIsolation tests that data doesn't leak between streams.
-// Requirements: 4.1, 4.2
 func TestConcurrentConnectionsDataIsolation(t *testing.T) {
-	// Start a local server that sends unique data per connection
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to create local listener: %v", err)
-	}
-	defer localListener.Close()
-	localPort := localListener.Addr().(*net.TCPAddr).Port
-
 	var connCounter int
 	var counterMu sync.Mutex
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			counterMu.Lock()
-			connCounter++
-			connID := connCounter
-			counterMu.Unlock()
 
-			go func(c net.Conn, id int) {
-				defer c.Close()
-				// Read client's identifier
-				buf := make([]byte, 1024)
-				n, err := c.Read(buf)
-				if err != nil {
-					return
-				}
-				clientID := string(buf[:n])
+	localSrv := NewLocalCustomServer(t, func(conn net.Conn) {
+		defer conn.Close()
+		counterMu.Lock()
+		connCounter++
+		connID := connCounter
+		counterMu.Unlock()
 
-				// Send back unique response with both IDs
-				response := fmt.Sprintf("server_conn_%d_client_%s", id, clientID)
-				c.Write([]byte(response))
-			}(conn, connID)
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
 		}
-	}()
+		clientID := string(buf[:n])
+		response := fmt.Sprintf("server_conn_%d_client_%s", connID, clientID)
+		conn.Write([]byte(response))
+	})
+	defer localSrv.Close()
 
-	// Start bore server and client
-	boreServer := server.NewServer(0, "")
-	go boreServer.Run()
-	defer boreServer.Close()
-	time.Sleep(100 * time.Millisecond)
+	env := NewIntegrationEnv(t, nil)
+	defer env.Stop()
 
-	boreClient := client.NewClient(boreServer.Addr(), localPort, "127.0.0.1", "")
-	if err := boreClient.Connect(); err != nil {
-		t.Fatalf("Client failed to connect: %v", err)
-	}
-	defer boreClient.Close()
+	client := env.ConnectClient(localSrv.Port, "")
+	defer client.Close()
 
-	go boreClient.Run()
-	time.Sleep(100 * time.Millisecond)
-
-	publicPort := boreClient.PublicPort()
-
-	// Create concurrent connections with unique identifiers
 	numConnections := 10
 	var wg sync.WaitGroup
 	responses := make(map[string]string)
@@ -468,18 +517,16 @@ func TestConcurrentConnectionsDataIsolation(t *testing.T) {
 		go func(connNum int) {
 			defer wg.Done()
 
-			conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
+			conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", client.PublicPort()))
 			if err != nil {
 				t.Errorf("Connection %d: failed to connect: %v", connNum, err)
 				return
 			}
 			defer conn.Close()
 
-			// Send unique identifier
 			clientID := fmt.Sprintf("client_%d", connNum)
 			conn.Write([]byte(clientID))
 
-			// Read response
 			buf := make([]byte, 1024)
 			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			n, err := conn.Read(buf)
@@ -496,12 +543,9 @@ func TestConcurrentConnectionsDataIsolation(t *testing.T) {
 
 	wg.Wait()
 
-	// Verify each client got its own response (no data leakage)
 	for clientID, response := range responses {
-		// Response should contain the client's ID
 		if !containsString(response, clientID) {
-			t.Errorf("Data isolation failure: client %s got response %s (doesn't contain its ID)",
-				clientID, response)
+			t.Errorf("Data isolation failure: client %s got response %s", clientID, response)
 		}
 	}
 
@@ -511,47 +555,16 @@ func TestConcurrentConnectionsDataIsolation(t *testing.T) {
 }
 
 // TestConcurrentConnectionsWithLargeData tests concurrent connections with larger data transfers.
-// Requirements: 4.1, 4.2
 func TestConcurrentConnectionsWithLargeData(t *testing.T) {
-	// Start a local echo server
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to create local listener: %v", err)
-	}
-	defer localListener.Close()
-	localPort := localListener.Addr().(*net.TCPAddr).Port
+	localEcho := NewLocalEchoServer(t)
+	defer localEcho.Close()
 
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				io.Copy(c, c) // Echo
-			}(conn)
-		}
-	}()
+	env := NewIntegrationEnv(t, nil)
+	defer env.Stop()
 
-	// Start bore server and client
-	boreServer := server.NewServer(0, "")
-	go boreServer.Run()
-	defer boreServer.Close()
-	time.Sleep(100 * time.Millisecond)
+	client := env.ConnectClient(localEcho.Port, "")
+	defer client.Close()
 
-	boreClient := client.NewClient(boreServer.Addr(), localPort, "127.0.0.1", "")
-	if err := boreClient.Connect(); err != nil {
-		t.Fatalf("Client failed to connect: %v", err)
-	}
-	defer boreClient.Close()
-
-	go boreClient.Run()
-	time.Sleep(100 * time.Millisecond)
-
-	publicPort := boreClient.PublicPort()
-
-	// Create concurrent connections with large data
 	numConnections := 3
 	dataSize := 64 * 1024 // 64KB per connection
 	var wg sync.WaitGroup
@@ -562,27 +575,24 @@ func TestConcurrentConnectionsWithLargeData(t *testing.T) {
 		go func(connNum int) {
 			defer wg.Done()
 
-			conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
+			conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", client.PublicPort()))
 			if err != nil {
 				errors <- fmt.Errorf("connection %d: failed to connect: %v", connNum, err)
 				return
 			}
 			defer conn.Close()
 
-			// Generate unique data pattern for this connection
 			data := make([]byte, dataSize)
 			for j := range data {
 				data[j] = byte((connNum*256 + j) % 256)
 			}
 
-			// Send data
 			_, err = conn.Write(data)
 			if err != nil {
 				errors <- fmt.Errorf("connection %d: failed to write: %v", connNum, err)
 				return
 			}
 
-			// Read response
 			response := make([]byte, dataSize)
 			conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 			_, err = io.ReadFull(conn, response)
@@ -591,7 +601,6 @@ func TestConcurrentConnectionsWithLargeData(t *testing.T) {
 				return
 			}
 
-			// Verify data integrity
 			for j := range data {
 				if data[j] != response[j] {
 					errors <- fmt.Errorf("connection %d: data mismatch at byte %d", connNum, j)
@@ -609,50 +618,19 @@ func TestConcurrentConnectionsWithLargeData(t *testing.T) {
 	}
 }
 
-// containsString checks if s contains substr
-func containsString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
+// ============================================================================
+// Shutdown and Disconnection Tests
+// ============================================================================
 
 // TestClientGracefulShutdown tests that client shuts down cleanly.
-// Requirements: 3.3, 4.2
 func TestClientGracefulShutdown(t *testing.T) {
-	// Start a local echo server
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to create local listener: %v", err)
-	}
-	defer localListener.Close()
-	localPort := localListener.Addr().(*net.TCPAddr).Port
+	localEcho := NewLocalEchoServer(t)
+	defer localEcho.Close()
 
-	localConnClosed := make(chan struct{}, 1)
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				io.Copy(c, c)
-				localConnClosed <- struct{}{}
-			}(conn)
-		}
-	}()
+	env := NewIntegrationEnv(t, nil)
+	defer env.Stop()
 
-	// Start bore server
-	boreServer := server.NewServer(0, "")
-	go boreServer.Run()
-	defer boreServer.Close()
-	time.Sleep(100 * time.Millisecond)
-
-	// Start bore client
-	boreClient := client.NewClient(boreServer.Addr(), localPort, "127.0.0.1", "")
+	boreClient := client.NewClient(env.ServerAddr(), localEcho.Port, "127.0.0.1", "")
 	if err := boreClient.Connect(); err != nil {
 		t.Fatalf("Client failed to connect: %v", err)
 	}
@@ -671,16 +649,14 @@ func TestClientGracefulShutdown(t *testing.T) {
 		t.Fatalf("Failed to connect through tunnel: %v", err)
 	}
 
-	// Send some data to establish the stream
 	externalConn.Write([]byte("hello"))
 	buf := make([]byte, 5)
 	externalConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	externalConn.Read(buf)
 
-	// Now close the client gracefully
+	// Close the client gracefully
 	boreClient.Close()
 
-	// Wait for client to finish
 	select {
 	case <-clientDone:
 		// Expected
@@ -698,31 +674,11 @@ func TestClientGracefulShutdown(t *testing.T) {
 }
 
 // TestServerGracefulShutdown tests that server shuts down cleanly.
-// Requirements: 3.3, 4.2
 func TestServerGracefulShutdown(t *testing.T) {
-	// Start a local echo server
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to create local listener: %v", err)
-	}
-	defer localListener.Close()
-	localPort := localListener.Addr().(*net.TCPAddr).Port
+	localEcho := NewLocalEchoServer(t)
+	defer localEcho.Close()
 
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				io.Copy(c, c)
-			}(conn)
-		}
-	}()
-
-	// Start bore server
-	boreServer := server.NewServer(0, "")
+	boreServer := server.NewServer(8081, "")
 	serverDone := make(chan error, 1)
 	go func() {
 		serverDone <- boreServer.Run()
@@ -731,8 +687,7 @@ func TestServerGracefulShutdown(t *testing.T) {
 
 	serverAddr := boreServer.Addr()
 
-	// Start bore client
-	boreClient := client.NewClient(serverAddr, localPort, "127.0.0.1", "")
+	boreClient := client.NewClient(serverAddr, localEcho.Port, "127.0.0.1", "")
 	if err := boreClient.Connect(); err != nil {
 		t.Fatalf("Client failed to connect: %v", err)
 	}
@@ -743,23 +698,20 @@ func TestServerGracefulShutdown(t *testing.T) {
 
 	publicPort := boreClient.PublicPort()
 
-	// Create an active connection through the tunnel
 	externalConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
 	if err != nil {
 		t.Fatalf("Failed to connect through tunnel: %v", err)
 	}
 	defer externalConn.Close()
 
-	// Send some data
 	externalConn.Write([]byte("hello"))
 	buf := make([]byte, 5)
 	externalConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	externalConn.Read(buf)
 
-	// Now close the server gracefully
+	// Close the server gracefully
 	boreServer.Close()
 
-	// Wait for server to finish
 	select {
 	case <-serverDone:
 		// Expected
@@ -775,45 +727,25 @@ func TestServerGracefulShutdown(t *testing.T) {
 }
 
 // TestAbruptClientDisconnection tests handling of sudden client disconnection.
-// Requirements: 3.3, 4.2
 func TestAbruptClientDisconnection(t *testing.T) {
-	// Start a local server that tracks connections
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to create local listener: %v", err)
-	}
-	defer localListener.Close()
-	localPort := localListener.Addr().(*net.TCPAddr).Port
-
 	localConnClosed := make(chan struct{}, 1)
-	go func() {
+	localSrv := NewLocalCustomServer(t, func(conn net.Conn) {
+		defer conn.Close()
+		buf := make([]byte, 1024)
 		for {
-			conn, err := localListener.Accept()
+			_, err := conn.Read(buf)
 			if err != nil {
+				localConnClosed <- struct{}{}
 				return
 			}
-			go func(c net.Conn) {
-				defer c.Close()
-				buf := make([]byte, 1024)
-				for {
-					_, err := c.Read(buf)
-					if err != nil {
-						localConnClosed <- struct{}{}
-						return
-					}
-				}
-			}(conn)
 		}
-	}()
+	})
+	defer localSrv.Close()
 
-	// Start bore server
-	boreServer := server.NewServer(0, "")
-	go boreServer.Run()
-	defer boreServer.Close()
-	time.Sleep(100 * time.Millisecond)
+	env := NewIntegrationEnv(t, nil)
+	defer env.Stop()
 
-	// Start bore client
-	boreClient := client.NewClient(boreServer.Addr(), localPort, "127.0.0.1", "")
+	boreClient := client.NewClient(env.ServerAddr(), localSrv.Port, "127.0.0.1", "")
 	if err := boreClient.Connect(); err != nil {
 		t.Fatalf("Client failed to connect: %v", err)
 	}
@@ -823,23 +755,20 @@ func TestAbruptClientDisconnection(t *testing.T) {
 
 	publicPort := boreClient.PublicPort()
 
-	// Create an active connection through the tunnel
 	externalConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
 	if err != nil {
 		t.Fatalf("Failed to connect through tunnel: %v", err)
 	}
 
-	// Send some data to establish the stream
 	externalConn.Write([]byte("hello"))
 	time.Sleep(100 * time.Millisecond)
 
-	// Abruptly close the client (simulating crash)
+	// Abruptly close the client
 	boreClient.Close()
 
-	// Verify local connection gets closed
 	select {
 	case <-localConnClosed:
-		// Expected - local connection should be closed when client disconnects
+		// Expected
 	case <-time.After(5 * time.Second):
 		t.Error("Local connection was not closed after client disconnection")
 	}
@@ -848,131 +777,67 @@ func TestAbruptClientDisconnection(t *testing.T) {
 }
 
 // TestAbruptExternalDisconnection tests handling of sudden external client disconnection.
-// Requirements: 3.3, 4.2
 func TestAbruptExternalDisconnection(t *testing.T) {
-	// Start a local server that tracks connections
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to create local listener: %v", err)
-	}
-	defer localListener.Close()
-	localPort := localListener.Addr().(*net.TCPAddr).Port
-
 	localConnClosed := make(chan struct{}, 1)
-	go func() {
+	localSrv := NewLocalCustomServer(t, func(conn net.Conn) {
+		defer conn.Close()
+		buf := make([]byte, 1024)
 		for {
-			conn, err := localListener.Accept()
+			_, err := conn.Read(buf)
 			if err != nil {
+				localConnClosed <- struct{}{}
 				return
 			}
-			go func(c net.Conn) {
-				defer c.Close()
-				buf := make([]byte, 1024)
-				for {
-					_, err := c.Read(buf)
-					if err != nil {
-						localConnClosed <- struct{}{}
-						return
-					}
-				}
-			}(conn)
 		}
-	}()
+	})
+	defer localSrv.Close()
 
-	// Start bore server and client
-	boreServer := server.NewServer(0, "")
-	go boreServer.Run()
-	defer boreServer.Close()
-	time.Sleep(100 * time.Millisecond)
+	env := NewIntegrationEnv(t, nil)
+	defer env.Stop()
 
-	boreClient := client.NewClient(boreServer.Addr(), localPort, "127.0.0.1", "")
-	if err := boreClient.Connect(); err != nil {
-		t.Fatalf("Client failed to connect: %v", err)
-	}
-	defer boreClient.Close()
+	client := env.ConnectClient(localSrv.Port, "")
+	defer client.Close()
 
-	go boreClient.Run()
-	time.Sleep(100 * time.Millisecond)
-
-	publicPort := boreClient.PublicPort()
-
-	// Create an active connection through the tunnel
-	externalConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
+	externalConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", client.PublicPort()))
 	if err != nil {
 		t.Fatalf("Failed to connect through tunnel: %v", err)
 	}
 
-	// Send some data to establish the stream
 	externalConn.Write([]byte("hello"))
 	time.Sleep(100 * time.Millisecond)
 
 	// Abruptly close the external connection
 	externalConn.Close()
 
-	// Verify local connection gets closed (connection close should propagate)
 	select {
 	case <-localConnClosed:
-		// Expected - local connection should be closed when external disconnects
+		// Expected
 	case <-time.After(5 * time.Second):
 		t.Error("Local connection was not closed after external disconnection")
 	}
 }
 
 // TestConnectionClosePropagatesToOtherEnd tests that closing one end propagates to the other.
-// Requirements: 3.3
 func TestConnectionClosePropagatesToOtherEnd(t *testing.T) {
-	// Start a local server that closes after receiving data
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to create local listener: %v", err)
-	}
-	defer localListener.Close()
-	localPort := localListener.Addr().(*net.TCPAddr).Port
+	localSrv := NewLocalCustomServer(t, func(conn net.Conn) {
+		buf := make([]byte, 1024)
+		conn.Read(buf)
+		conn.Write([]byte("goodbye"))
+		conn.Close()
+	})
+	defer localSrv.Close()
 
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				// Read one message then close
-				buf := make([]byte, 1024)
-				c.Read(buf)
-				c.Write([]byte("goodbye"))
-				c.Close()
-			}(conn)
-		}
-	}()
+	env := NewIntegrationEnv(t, nil)
+	defer env.Stop()
 
-	// Start bore server and client
-	boreServer := server.NewServer(0, "")
-	go boreServer.Run()
-	defer boreServer.Close()
-	time.Sleep(100 * time.Millisecond)
+	client := env.ConnectClient(localSrv.Port, "")
+	defer client.Close()
 
-	boreClient := client.NewClient(boreServer.Addr(), localPort, "127.0.0.1", "")
-	if err := boreClient.Connect(); err != nil {
-		t.Fatalf("Client failed to connect: %v", err)
-	}
-	defer boreClient.Close()
-
-	go boreClient.Run()
-	time.Sleep(100 * time.Millisecond)
-
-	publicPort := boreClient.PublicPort()
-
-	// Connect through tunnel
-	externalConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
-	if err != nil {
-		t.Fatalf("Failed to connect through tunnel: %v", err)
-	}
+	externalConn := client.ConnectThroughTunnel()
 	defer externalConn.Close()
 
-	// Send data
 	externalConn.Write([]byte("hello"))
 
-	// Read response
 	buf := make([]byte, 1024)
 	externalConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	n, err := externalConn.Read(buf)
@@ -988,61 +853,31 @@ func TestConnectionClosePropagatesToOtherEnd(t *testing.T) {
 	externalConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	_, err = externalConn.Read(buf)
 	if err == nil {
-		t.Error("Expected EOF after local server closed, but read succeeded")
+		t.Error("Expected EOF after local server closed")
 	}
 }
 
+// ============================================================================
+// Authentication Tests
+// ============================================================================
+
 // TestAuthenticationWithMatchingSecrets tests successful authentication.
-// Requirements: 7.1, 7.2, 7.3, 7.6
 func TestAuthenticationWithMatchingSecrets(t *testing.T) {
-	// Start a local echo server
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to create local listener: %v", err)
-	}
-	defer localListener.Close()
-	localPort := localListener.Addr().(*net.TCPAddr).Port
+	localEcho := NewLocalEchoServer(t)
+	defer localEcho.Close()
 
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				io.Copy(c, c)
-			}(conn)
-		}
-	}()
-
-	// Start bore server with secret
 	secret := "my-super-secret-token-123"
-	boreServer := server.NewServer(0, secret)
-	go boreServer.Run()
-	defer boreServer.Close()
-	time.Sleep(100 * time.Millisecond)
+	env := NewIntegrationEnv(t, &IntegrationEnvConfig{Port: 8081, Secret: secret})
+	defer env.Stop()
 
-	// Start bore client with matching secret
-	boreClient := client.NewClient(boreServer.Addr(), localPort, "127.0.0.1", secret)
-	if err := boreClient.Connect(); err != nil {
-		t.Fatalf("Client with matching secret should connect successfully: %v", err)
-	}
-	defer boreClient.Close()
+	client := env.ConnectClient(localEcho.Port, secret)
+	defer client.Close()
 
-	go boreClient.Run()
-	time.Sleep(100 * time.Millisecond)
-
-	publicPort := boreClient.PublicPort()
-	if publicPort == 0 {
+	if client.PublicPort() == 0 {
 		t.Fatal("Public port should be allocated after successful authentication")
 	}
 
-	// Verify tunnel works
-	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
-	if err != nil {
-		t.Fatalf("Failed to connect through tunnel: %v", err)
-	}
+	conn := client.ConnectThroughTunnel()
 	defer conn.Close()
 
 	testData := []byte("authenticated tunnel test")
@@ -1050,7 +885,7 @@ func TestAuthenticationWithMatchingSecrets(t *testing.T) {
 
 	buf := make([]byte, len(testData))
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, err = io.ReadFull(conn, buf)
+	_, err := io.ReadFull(conn, buf)
 	if err != nil {
 		t.Fatalf("Failed to read through tunnel: %v", err)
 	}
@@ -1061,18 +896,13 @@ func TestAuthenticationWithMatchingSecrets(t *testing.T) {
 }
 
 // TestAuthenticationWithWrongSecret tests failed authentication.
-// Requirements: 7.1, 7.2, 7.3
 func TestAuthenticationWithWrongSecret(t *testing.T) {
-	// Start bore server with secret
 	serverSecret := "correct-secret"
-	boreServer := server.NewServer(0, serverSecret)
-	go boreServer.Run()
-	defer boreServer.Close()
-	time.Sleep(100 * time.Millisecond)
+	env := NewIntegrationEnv(t, &IntegrationEnvConfig{Port: 8081, Secret: serverSecret})
+	defer env.Stop()
 
-	// Try to connect with wrong secret
 	wrongSecret := "wrong-secret"
-	boreClient := client.NewClient(boreServer.Addr(), 8080, "127.0.0.1", wrongSecret)
+	boreClient := client.NewClient(env.ServerAddr(), 8080, "127.0.0.1", wrongSecret)
 	err := boreClient.Connect()
 
 	if err == nil {
@@ -1080,24 +910,18 @@ func TestAuthenticationWithWrongSecret(t *testing.T) {
 		t.Fatal("Client with wrong secret should fail to connect")
 	}
 
-	// Verify error message indicates authentication failure
 	if !containsString(err.Error(), "authentication") && !containsString(err.Error(), "failed") {
 		t.Errorf("Error should indicate authentication failure, got: %v", err)
 	}
 }
 
-// TestAuthenticationWithEmptySecretAgainstProtectedServer tests that empty secret fails against protected server.
-// Requirements: 7.1, 7.3
+// TestAuthenticationWithEmptySecretAgainstProtectedServer tests that empty secret fails.
 func TestAuthenticationWithEmptySecretAgainstProtectedServer(t *testing.T) {
-	// Start bore server with secret
 	serverSecret := "server-requires-auth"
-	boreServer := server.NewServer(0, serverSecret)
-	go boreServer.Run()
-	defer boreServer.Close()
-	time.Sleep(100 * time.Millisecond)
+	env := NewIntegrationEnv(t, &IntegrationEnvConfig{Port: 8081, Secret: serverSecret})
+	defer env.Stop()
 
-	// Try to connect without secret
-	boreClient := client.NewClient(boreServer.Addr(), 8080, "127.0.0.1", "")
+	boreClient := client.NewClient(env.ServerAddr(), 8080, "127.0.0.1", "")
 	err := boreClient.Connect()
 
 	if err == nil {
@@ -1107,50 +931,17 @@ func TestAuthenticationWithEmptySecretAgainstProtectedServer(t *testing.T) {
 }
 
 // TestOpenModeNoSecret tests that server without secret accepts all connections.
-// Requirements: 7.5
 func TestOpenModeNoSecret(t *testing.T) {
-	// Start a local echo server
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to create local listener: %v", err)
-	}
-	defer localListener.Close()
-	localPort := localListener.Addr().(*net.TCPAddr).Port
+	localEcho := NewLocalEchoServer(t)
+	defer localEcho.Close()
 
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				io.Copy(c, c)
-			}(conn)
-		}
-	}()
+	env := NewIntegrationEnv(t, nil) // No secret = open mode
+	defer env.Stop()
 
-	// Start bore server without secret (open mode)
-	boreServer := server.NewServer(0, "")
-	go boreServer.Run()
-	defer boreServer.Close()
-	time.Sleep(100 * time.Millisecond)
+	client := env.ConnectClient(localEcho.Port, "")
+	defer client.Close()
 
-	// Connect without secret
-	boreClient := client.NewClient(boreServer.Addr(), localPort, "127.0.0.1", "")
-	if err := boreClient.Connect(); err != nil {
-		t.Fatalf("Client should connect to open server: %v", err)
-	}
-	defer boreClient.Close()
-
-	go boreClient.Run()
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify tunnel works
-	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", boreClient.PublicPort()))
-	if err != nil {
-		t.Fatalf("Failed to connect through tunnel: %v", err)
-	}
+	conn := client.ConnectThroughTunnel()
 	defer conn.Close()
 
 	testData := []byte("open mode test")
@@ -1166,50 +957,18 @@ func TestOpenModeNoSecret(t *testing.T) {
 }
 
 // TestOpenModeAcceptsClientWithSecret tests that open server accepts clients that send a secret.
-// Requirements: 7.5
 func TestOpenModeAcceptsClientWithSecret(t *testing.T) {
-	// Start a local echo server
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to create local listener: %v", err)
-	}
-	defer localListener.Close()
-	localPort := localListener.Addr().(*net.TCPAddr).Port
+	localEcho := NewLocalEchoServer(t)
+	defer localEcho.Close()
 
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				io.Copy(c, c)
-			}(conn)
-		}
-	}()
-
-	// Start bore server without secret (open mode)
-	boreServer := server.NewServer(0, "")
-	go boreServer.Run()
-	defer boreServer.Close()
-	time.Sleep(100 * time.Millisecond)
+	env := NewIntegrationEnv(t, nil) // No secret = open mode
+	defer env.Stop()
 
 	// Connect WITH a secret (server should still accept since it's in open mode)
-	boreClient := client.NewClient(boreServer.Addr(), localPort, "127.0.0.1", "some-secret")
-	if err := boreClient.Connect(); err != nil {
-		t.Fatalf("Open server should accept client with secret: %v", err)
-	}
-	defer boreClient.Close()
+	client := env.ConnectClient(localEcho.Port, "some-secret")
+	defer client.Close()
 
-	go boreClient.Run()
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify tunnel works
-	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", boreClient.PublicPort()))
-	if err != nil {
-		t.Fatalf("Failed to connect through tunnel: %v", err)
-	}
+	conn := client.ConnectThroughTunnel()
 	defer conn.Close()
 
 	testData := []byte("open mode with client secret")
@@ -1225,56 +984,24 @@ func TestOpenModeAcceptsClientWithSecret(t *testing.T) {
 }
 
 // TestMultipleClientsWithSameSecret tests that multiple clients can connect with the same secret.
-// Requirements: 7.1, 7.6
 func TestMultipleClientsWithSameSecret(t *testing.T) {
 	// Start local echo servers
-	localListeners := make([]net.Listener, 3)
-	localPorts := make([]int, 3)
-
+	localServers := make([]*LocalEchoServer, 3)
 	for i := 0; i < 3; i++ {
-		listener, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("Failed to create local listener %d: %v", i, err)
-		}
-		defer listener.Close()
-		localListeners[i] = listener
-		localPorts[i] = listener.Addr().(*net.TCPAddr).Port
-
-		go func(l net.Listener) {
-			for {
-				conn, err := l.Accept()
-				if err != nil {
-					return
-				}
-				go func(c net.Conn) {
-					defer c.Close()
-					io.Copy(c, c)
-				}(conn)
-			}
-		}(listener)
+		localServers[i] = NewLocalEchoServer(t)
+		defer localServers[i].Close()
 	}
 
-	// Start bore server with secret
 	secret := "shared-secret"
-	boreServer := server.NewServer(0, secret)
-	go boreServer.Run()
-	defer boreServer.Close()
-	time.Sleep(100 * time.Millisecond)
+	env := NewIntegrationEnv(t, &IntegrationEnvConfig{Port: 8081, Secret: secret})
+	defer env.Stop()
 
 	// Connect multiple clients with the same secret
-	clients := make([]*client.Client, 3)
+	clients := make([]*ConnectedBoreClient, 3)
 	for i := 0; i < 3; i++ {
-		c := client.NewClient(boreServer.Addr(), localPorts[i], "127.0.0.1", secret)
-		if err := c.Connect(); err != nil {
-			t.Fatalf("Client %d failed to connect: %v", i, err)
-		}
-		defer c.Close()
-		clients[i] = c
-
-		go c.Run()
+		clients[i] = env.ConnectClient(localServers[i].Port, secret)
+		defer clients[i].Close()
 	}
-
-	time.Sleep(100 * time.Millisecond)
 
 	// Verify all clients got different public ports
 	ports := make(map[uint16]bool)
@@ -1291,11 +1018,7 @@ func TestMultipleClientsWithSameSecret(t *testing.T) {
 
 	// Verify all tunnels work
 	for i, c := range clients {
-		conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", c.PublicPort()))
-		if err != nil {
-			t.Errorf("Failed to connect to client %d tunnel: %v", i, err)
-			continue
-		}
+		conn := c.ConnectThroughTunnel()
 
 		testData := []byte(fmt.Sprintf("client%d", i))
 		conn.Write(testData)

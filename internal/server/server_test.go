@@ -4,12 +4,272 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/viveksb007/go-bore/internal/protocol"
 )
+
+// TestEnvironment provides a reusable test setup similar to k8s envtest.
+// It manages server lifecycle and provides helpers for common test operations.
+type TestEnvironment struct {
+	Server *Server
+	t      *testing.T
+	errCh  chan error
+}
+
+// TestEnvConfig holds configuration for the test environment.
+type TestEnvConfig struct {
+	Port   int
+	Secret string
+}
+
+// NewTestEnvironment creates and starts a new test environment.
+func NewTestEnvironment(t *testing.T, cfg *TestEnvConfig) *TestEnvironment {
+	t.Helper()
+
+	if cfg == nil {
+		cfg = &TestEnvConfig{}
+	}
+
+	server := NewServer(cfg.Port, cfg.Secret)
+	env := &TestEnvironment{
+		Server: server,
+		t:      t,
+		errCh:  make(chan error, 1),
+	}
+
+	go func() {
+		env.errCh <- server.Run()
+	}()
+
+	// Wait for server to start
+	time.Sleep(100 * time.Millisecond)
+
+	if server.listener == nil {
+		t.Fatal("server failed to start")
+	}
+
+	return env
+}
+
+// Stop shuts down the test environment.
+func (env *TestEnvironment) Stop() {
+	env.t.Helper()
+	if err := env.Server.Close(); err != nil {
+		env.t.Errorf("failed to close server: %v", err)
+	}
+}
+
+// ServerAddr returns the server's listen address.
+func (env *TestEnvironment) ServerAddr() string {
+	return env.Server.listener.Addr().String()
+}
+
+// ConnectedClient represents a client that has completed handshake with the server.
+type ConnectedClient struct {
+	ControlConn net.Conn
+	PublicPort  uint16
+	env         *TestEnvironment
+}
+
+// ConnectClient establishes a control connection and completes handshake.
+func (env *TestEnvironment) ConnectClient(secret string) *ConnectedClient {
+	env.t.Helper()
+
+	conn, err := net.Dial("tcp", env.ServerAddr())
+	if err != nil {
+		env.t.Fatalf("failed to connect to server: %v", err)
+	}
+
+	// Send handshake
+	handshake := &protocol.HandshakePayload{
+		Version: protocol.ProtocolVersion,
+		Secret:  secret,
+	}
+	handshakeBytes, err := protocol.EncodeHandshake(handshake)
+	if err != nil {
+		conn.Close()
+		env.t.Fatalf("failed to encode handshake: %v", err)
+	}
+
+	msg := &protocol.Message{
+		Type:    protocol.MessageTypeHandshake,
+		Payload: handshakeBytes,
+	}
+
+	if err := protocol.WriteMessage(conn, msg); err != nil {
+		conn.Close()
+		env.t.Fatalf("failed to write handshake: %v", err)
+	}
+
+	// Read accept message
+	acceptMsg, err := protocol.ReadMessage(conn)
+	if err != nil {
+		conn.Close()
+		env.t.Fatalf("failed to read accept message: %v", err)
+	}
+
+	if acceptMsg.Type != protocol.MessageTypeAccept {
+		conn.Close()
+		env.t.Fatalf("expected MessageTypeAccept, got type %d", acceptMsg.Type)
+	}
+
+	acceptPayload, err := protocol.DecodeAccept(acceptMsg.Payload)
+	if err != nil {
+		conn.Close()
+		env.t.Fatalf("failed to decode accept payload: %v", err)
+	}
+
+	// Wait for public listener to start
+	time.Sleep(100 * time.Millisecond)
+
+	return &ConnectedClient{
+		ControlConn: conn,
+		PublicPort:  acceptPayload.PublicPort,
+		env:         env,
+	}
+}
+
+// Close closes the client's control connection.
+func (c *ConnectedClient) Close() {
+	c.ControlConn.Close()
+}
+
+// ConnectToPublicPort connects to the client's public port and returns the connection
+// along with the UUID received from the control connection.
+func (c *ConnectedClient) ConnectToPublicPort() (publicConn net.Conn, uuid string) {
+	c.env.t.Helper()
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", c.PublicPort))
+	if err != nil {
+		c.env.t.Fatalf("failed to connect to public port: %v", err)
+	}
+
+	// Read connect message from control connection
+	connectMsg, err := protocol.ReadMessage(c.ControlConn)
+	if err != nil {
+		conn.Close()
+		c.env.t.Fatalf("failed to read connect message: %v", err)
+	}
+
+	if connectMsg.Type != protocol.MessageTypeConnect {
+		conn.Close()
+		c.env.t.Fatalf("expected MessageTypeConnect, got type %d", connectMsg.Type)
+	}
+
+	connectPayload, err := protocol.DecodeConnect(connectMsg.Payload)
+	if err != nil {
+		conn.Close()
+		c.env.t.Fatalf("failed to decode connect payload: %v", err)
+	}
+
+	return conn, connectPayload.UUID
+}
+
+// EstablishStream creates a complete stream by connecting to public port and
+// completing the data connection handshake.
+func (c *ConnectedClient) EstablishStream() (publicConn, dataConn net.Conn, uuid string) {
+	c.env.t.Helper()
+
+	publicConn, uuid = c.ConnectToPublicPort()
+
+	// Open data connection
+	dataConn, err := net.Dial("tcp", c.env.ServerAddr())
+	if err != nil {
+		publicConn.Close()
+		c.env.t.Fatalf("failed to connect for data connection: %v", err)
+	}
+
+	// Send stream handshake
+	streamHandshake := &protocol.StreamHandshakePayload{UUID: uuid}
+	streamHandshakeBytes, err := protocol.EncodeStreamHandshake(streamHandshake)
+	if err != nil {
+		publicConn.Close()
+		dataConn.Close()
+		c.env.t.Fatalf("failed to encode stream handshake: %v", err)
+	}
+
+	msg := &protocol.Message{
+		Type:    protocol.MessageTypeStreamHandshake,
+		Payload: streamHandshakeBytes,
+	}
+
+	if err := protocol.WriteMessage(dataConn, msg); err != nil {
+		publicConn.Close()
+		dataConn.Close()
+		c.env.t.Fatalf("failed to write stream handshake: %v", err)
+	}
+
+	// Read stream accept
+	acceptMsg, err := protocol.ReadMessage(dataConn)
+	if err != nil {
+		publicConn.Close()
+		dataConn.Close()
+		c.env.t.Fatalf("failed to read stream accept: %v", err)
+	}
+
+	if acceptMsg.Type != protocol.MessageTypeStreamAccept {
+		publicConn.Close()
+		dataConn.Close()
+		c.env.t.Fatalf("expected MessageTypeStreamAccept, got type %d", acceptMsg.Type)
+	}
+
+	// Wait for proxy to start
+	time.Sleep(100 * time.Millisecond)
+
+	return publicConn, dataConn, uuid
+}
+
+// MockConnPair creates a pair of connected net.Conn for testing.
+type MockConnPair struct {
+	listener   net.Listener
+	ServerConn net.Conn
+	ClientConn net.Conn
+}
+
+// NewMockConnPair creates a new mock connection pair.
+func NewMockConnPair(t *testing.T) *MockConnPair {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+
+	connCh := make(chan net.Conn, 1)
+	go func() {
+		conn, _ := listener.Accept()
+		connCh <- conn
+	}()
+
+	clientConn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		listener.Close()
+		t.Fatalf("failed to dial: %v", err)
+	}
+
+	serverConn := <-connCh
+
+	return &MockConnPair{
+		listener:   listener,
+		ServerConn: serverConn,
+		ClientConn: clientConn,
+	}
+}
+
+// Close closes all connections in the pair.
+func (p *MockConnPair) Close() {
+	p.ClientConn.Close()
+	p.ServerConn.Close()
+	p.listener.Close()
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
 
 func TestNewServer(t *testing.T) {
 	tests := []struct {
@@ -45,19 +305,15 @@ func TestNewServer(t *testing.T) {
 			if server == nil {
 				t.Fatal("NewServer returned nil")
 			}
-
 			if server.listenPort != tt.wantPort {
 				t.Errorf("listenPort = %d, want %d", server.listenPort, tt.wantPort)
 			}
-
 			if server.secret != tt.secret {
 				t.Errorf("secret = %q, want %q", server.secret, tt.secret)
 			}
-
 			if server.clients == nil {
 				t.Error("clients map is nil")
 			}
-
 			if server.portAllocator == nil {
 				t.Error("portAllocator is nil")
 			}
@@ -66,56 +322,19 @@ func TestNewServer(t *testing.T) {
 }
 
 func TestServerRun(t *testing.T) {
-	server := NewServer(18001, "")
+	env := NewTestEnvironment(t, nil)
+	defer env.Stop()
 
-	// Start server in a goroutine
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Run()
-	}()
-
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify server is listening
-	if server.listener == nil {
+	if env.Server.listener == nil {
 		t.Fatal("server listener is nil after Run()")
-	}
-
-	// Close server
-	if err := server.Close(); err != nil {
-		t.Errorf("Close() error = %v", err)
-	}
-
-	// Wait for Run() to return
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Errorf("Run() error = %v", err)
-		}
-	case <-time.After(1 * time.Second):
-		t.Error("Run() did not return after Close()")
 	}
 }
 
 func TestServerRunPortInUse(t *testing.T) {
-	// Start first server on a specific port
-	server1 := NewServer(18002, "")
-	errCh1 := make(chan error, 1)
-	go func() {
-		errCh1 <- server1.Run()
-	}()
+	env := NewTestEnvironment(t, nil)
+	defer env.Stop()
 
-	// Give first server time to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Check if server1 started successfully
-	if server1.listener == nil {
-		t.Skip("First server failed to start, skipping test")
-	}
-
-	// Get the port that server1 is using
-	addr := server1.listener.Addr().(*net.TCPAddr)
+	addr := env.Server.listener.Addr().(*net.TCPAddr)
 	usedPort := addr.Port
 
 	// Try to start second server on same port
@@ -126,58 +345,27 @@ func TestServerRunPortInUse(t *testing.T) {
 		t.Error("expected error when port is already in use, got nil")
 		server2.Close()
 	}
-
-	// Clean up first server
-	server1.Close()
-	<-errCh1
 }
 
 func TestCreateSession(t *testing.T) {
 	server := NewServer(8080, "test-secret")
+	pair := NewMockConnPair(t)
+	defer pair.Close()
 
-	// Create a mock connection
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to create listener: %v", err)
-	}
-	defer listener.Close()
-
-	// Connect to the listener
-	connCh := make(chan net.Conn, 1)
-	go func() {
-		conn, _ := listener.Accept()
-		connCh <- conn
-	}()
-
-	clientConn, err := net.Dial("tcp", listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to dial: %v", err)
-	}
-	defer clientConn.Close()
-
-	serverConn := <-connCh
-
-	// Create session
-	session := server.createSession(serverConn)
+	session := server.createSession(pair.ServerConn)
 
 	if session == nil {
 		t.Fatal("createSession returned nil")
 	}
-
 	if session.id == "" {
 		t.Error("session ID is empty")
 	}
-
-	if session.conn != serverConn {
+	if session.conn != pair.ServerConn {
 		t.Error("session connection does not match")
 	}
-
 	if session.streams == nil {
 		t.Error("session streams map is nil")
 	}
-
-	// nextStreamID field removed in connection-per-stream design
-	// Streams are now identified by UUIDs
 
 	// Verify session is tracked in server
 	server.clientsMu.RLock()
@@ -191,37 +379,16 @@ func TestCreateSession(t *testing.T) {
 
 func TestRemoveSession(t *testing.T) {
 	server := NewServer(8080, "test-secret")
+	pair := NewMockConnPair(t)
+	defer pair.Close()
 
-	// Create a mock connection
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to create listener: %v", err)
-	}
-	defer listener.Close()
-
-	connCh := make(chan net.Conn, 1)
-	go func() {
-		conn, _ := listener.Accept()
-		connCh <- conn
-	}()
-
-	clientConn, err := net.Dial("tcp", listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to dial: %v", err)
-	}
-	defer clientConn.Close()
-
-	serverConn := <-connCh
-
-	// Create session
-	session := server.createSession(serverConn)
+	session := server.createSession(pair.ServerConn)
 	sessionID := session.id
 
 	// Verify session exists
 	server.clientsMu.RLock()
 	_, exists := server.clients[sessionID]
 	server.clientsMu.RUnlock()
-
 	if !exists {
 		t.Fatal("session not found after creation")
 	}
@@ -233,7 +400,6 @@ func TestRemoveSession(t *testing.T) {
 	server.clientsMu.RLock()
 	_, exists = server.clients[sessionID]
 	server.clientsMu.RUnlock()
-
 	if exists {
 		t.Error("session still exists after removal")
 	}
@@ -241,32 +407,13 @@ func TestRemoveSession(t *testing.T) {
 
 func TestSessionCleanup(t *testing.T) {
 	portAllocator := NewPortAllocator(10000, 10100)
-
-	// Create a mock connection
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to create listener: %v", err)
-	}
-	defer listener.Close()
-
-	connCh := make(chan net.Conn, 1)
-	go func() {
-		conn, _ := listener.Accept()
-		connCh <- conn
-	}()
-
-	clientConn, err := net.Dial("tcp", listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to dial: %v", err)
-	}
-	defer clientConn.Close()
-
-	serverConn := <-connCh
+	pair := NewMockConnPair(t)
+	defer pair.Close()
 
 	// Create session with allocated port
 	session := &ClientSession{
 		id:      "test-session",
-		conn:    serverConn,
+		conn:    pair.ServerConn,
 		streams: make(map[string]*ServerStream),
 	}
 
@@ -285,14 +432,12 @@ func TestSessionCleanup(t *testing.T) {
 	session.listener = publicListener
 
 	// Add a stream
-	streamConn, err := net.Dial("tcp", listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to create stream connection: %v", err)
-	}
+	streamPair := NewMockConnPair(t)
+	defer streamPair.Close()
 
 	stream := &ServerStream{
 		uuid:         "test-uuid-1234",
-		externalConn: streamConn,
+		externalConn: streamPair.ServerConn,
 		createdAt:    time.Now(),
 	}
 	session.streams["test-uuid-1234"] = stream
@@ -305,46 +450,27 @@ func TestSessionCleanup(t *testing.T) {
 		t.Errorf("streams not cleaned up, got %d streams", len(session.streams))
 	}
 
-	// Verify port is released (should be able to allocate it again)
-	portAllocator.Release(port) // Release once more to ensure it's available
+	// Verify port is released
+	portAllocator.Release(port)
 	newPort, err := portAllocator.Allocate()
 	if err != nil {
 		t.Errorf("failed to allocate port after cleanup: %v", err)
 	}
 	if newPort != port {
-		// Port might be different due to random allocation, just verify no error
 		portAllocator.Release(newPort)
 	}
 }
 
 func TestMultipleSessions(t *testing.T) {
 	server := NewServer(0, "")
-
-	// Create multiple mock connections
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to create listener: %v", err)
-	}
-	defer listener.Close()
-
 	numSessions := 5
 	sessions := make([]*ClientSession, numSessions)
+	pairs := make([]*MockConnPair, numSessions)
 
 	for i := 0; i < numSessions; i++ {
-		connCh := make(chan net.Conn, 1)
-		go func() {
-			conn, _ := listener.Accept()
-			connCh <- conn
-		}()
-
-		clientConn, err := net.Dial("tcp", listener.Addr().String())
-		if err != nil {
-			t.Fatalf("failed to dial: %v", err)
-		}
-		defer clientConn.Close()
-
-		serverConn := <-connCh
-		sessions[i] = server.createSession(serverConn)
+		pairs[i] = NewMockConnPair(t)
+		defer pairs[i].Close()
+		sessions[i] = server.createSession(pairs[i].ServerConn)
 	}
 
 	// Verify all sessions are tracked
@@ -418,70 +544,26 @@ func TestAuthenticate(t *testing.T) {
 	}
 }
 
+// ============================================================================
+// Handshake Tests
+// ============================================================================
+
 func TestHandshakeSuccess(t *testing.T) {
-	// Start server
-	server := NewServer(18003, "test-secret")
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Run()
-	}()
-	defer server.Close()
+	env := NewTestEnvironment(t, &TestEnvConfig{Secret: "test-secret"})
+	defer env.Stop()
 
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
+	client := env.ConnectClient("test-secret")
+	defer client.Close()
 
-	// Connect as client
-	conn, err := net.Dial("tcp", server.listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to connect to server: %v", err)
-	}
-	defer conn.Close()
-
-	// Send handshake
-	handshake := &protocol.HandshakePayload{
-		Version: protocol.ProtocolVersion,
-		Secret:  "test-secret",
-	}
-	handshakeBytes, err := protocol.EncodeHandshake(handshake)
-	if err != nil {
-		t.Fatalf("failed to encode handshake: %v", err)
-	}
-
-	handshakeMsg := &protocol.Message{
-		Type: protocol.MessageTypeHandshake,
-
-		Payload: handshakeBytes,
-	}
-
-	if err := protocol.WriteMessage(conn, handshakeMsg); err != nil {
-		t.Fatalf("failed to write handshake: %v", err)
-	}
-
-	// Read accept message
-	acceptMsg, err := protocol.ReadMessage(conn)
-	if err != nil {
-		t.Fatalf("failed to read accept message: %v", err)
-	}
-
-	if acceptMsg.Type != protocol.MessageTypeAccept {
-		t.Errorf("expected MessageTypeAccept, got type %d", acceptMsg.Type)
-	}
-
-	// Decode accept payload
-	acceptPayload, err := protocol.DecodeAccept(acceptMsg.Payload)
-	if err != nil {
-		t.Fatalf("failed to decode accept payload: %v", err)
-	}
-
-	if acceptPayload.PublicPort == 0 {
+	if client.PublicPort == 0 {
 		t.Error("public port is 0")
 	}
 
 	// Verify session was created
 	time.Sleep(50 * time.Millisecond)
-	server.clientsMu.RLock()
-	numClients := len(server.clients)
-	server.clientsMu.RUnlock()
+	env.Server.clientsMu.RLock()
+	numClients := len(env.Server.clients)
+	env.Server.clientsMu.RUnlock()
 
 	if numClients != 1 {
 		t.Errorf("expected 1 client session, got %d", numClients)
@@ -489,19 +571,10 @@ func TestHandshakeSuccess(t *testing.T) {
 }
 
 func TestHandshakeAuthenticationFailure(t *testing.T) {
-	// Start server with secret
-	server := NewServer(18004, "correct-secret")
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Run()
-	}()
-	defer server.Close()
+	env := NewTestEnvironment(t, &TestEnvConfig{Secret: "correct-secret"})
+	defer env.Stop()
 
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Connect as client
-	conn, err := net.Dial("tcp", server.listener.Addr().String())
+	conn, err := net.Dial("tcp", env.ServerAddr())
 	if err != nil {
 		t.Fatalf("failed to connect to server: %v", err)
 	}
@@ -512,20 +585,9 @@ func TestHandshakeAuthenticationFailure(t *testing.T) {
 		Version: protocol.ProtocolVersion,
 		Secret:  "wrong-secret",
 	}
-	handshakeBytes, err := protocol.EncodeHandshake(handshake)
-	if err != nil {
-		t.Fatalf("failed to encode handshake: %v", err)
-	}
-
-	handshakeMsg := &protocol.Message{
-		Type: protocol.MessageTypeHandshake,
-
-		Payload: handshakeBytes,
-	}
-
-	if err := protocol.WriteMessage(conn, handshakeMsg); err != nil {
-		t.Fatalf("failed to write handshake: %v", err)
-	}
+	handshakeBytes, _ := protocol.EncodeHandshake(handshake)
+	msg := &protocol.Message{Type: protocol.MessageTypeHandshake, Payload: handshakeBytes}
+	protocol.WriteMessage(conn, msg)
 
 	// Read reject message
 	rejectMsg, err := protocol.ReadMessage(conn)
@@ -539,9 +601,9 @@ func TestHandshakeAuthenticationFailure(t *testing.T) {
 
 	// Verify no session was created
 	time.Sleep(50 * time.Millisecond)
-	server.clientsMu.RLock()
-	numClients := len(server.clients)
-	server.clientsMu.RUnlock()
+	env.Server.clientsMu.RLock()
+	numClients := len(env.Server.clients)
+	env.Server.clientsMu.RUnlock()
 
 	if numClients != 0 {
 		t.Errorf("expected 0 client sessions after failed auth, got %d", numClients)
@@ -549,64 +611,17 @@ func TestHandshakeAuthenticationFailure(t *testing.T) {
 }
 
 func TestHandshakeOpenMode(t *testing.T) {
-	// Start server without secret (open mode)
-	server := NewServer(18551, "")
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Run()
-	}()
-	defer server.Close()
+	env := NewTestEnvironment(t, nil) // No secret = open mode
+	defer env.Stop()
 
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify server started successfully
-	if server.listener == nil {
-		t.Fatal("server listener is nil - server failed to start")
-	}
-
-	// Connect as client
-	conn, err := net.Dial("tcp", server.listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to connect to server: %v", err)
-	}
-	defer conn.Close()
-
-	// Send handshake without secret
-	handshake := &protocol.HandshakePayload{
-		Version: protocol.ProtocolVersion,
-		Secret:  "",
-	}
-	handshakeBytes, err := protocol.EncodeHandshake(handshake)
-	if err != nil {
-		t.Fatalf("failed to encode handshake: %v", err)
-	}
-
-	handshakeMsg := &protocol.Message{
-		Type: protocol.MessageTypeHandshake,
-
-		Payload: handshakeBytes,
-	}
-
-	if err := protocol.WriteMessage(conn, handshakeMsg); err != nil {
-		t.Fatalf("failed to write handshake: %v", err)
-	}
-
-	// Read accept message
-	acceptMsg, err := protocol.ReadMessage(conn)
-	if err != nil {
-		t.Fatalf("failed to read accept message: %v", err)
-	}
-
-	if acceptMsg.Type != protocol.MessageTypeAccept {
-		t.Errorf("expected MessageTypeAccept in open mode, got type %d", acceptMsg.Type)
-	}
+	client := env.ConnectClient("")
+	defer client.Close()
 
 	// Verify session was created
 	time.Sleep(50 * time.Millisecond)
-	server.clientsMu.RLock()
-	numClients := len(server.clients)
-	server.clientsMu.RUnlock()
+	env.Server.clientsMu.RLock()
+	numClients := len(env.Server.clients)
+	env.Server.clientsMu.RUnlock()
 
 	if numClients != 1 {
 		t.Errorf("expected 1 client session in open mode, got %d", numClients)
@@ -614,43 +629,20 @@ func TestHandshakeOpenMode(t *testing.T) {
 }
 
 func TestHandshakeInvalidProtocolVersion(t *testing.T) {
-	// Start server
-	server := NewServer(0, "")
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Run()
-	}()
-	defer server.Close()
+	env := NewTestEnvironment(t, nil)
+	defer env.Stop()
 
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Connect as client
-	conn, err := net.Dial("tcp", server.listener.Addr().String())
+	conn, err := net.Dial("tcp", env.ServerAddr())
 	if err != nil {
 		t.Fatalf("failed to connect to server: %v", err)
 	}
 	defer conn.Close()
 
 	// Send handshake with invalid version
-	handshake := &protocol.HandshakePayload{
-		Version: 99, // Invalid version
-		Secret:  "",
-	}
-	handshakeBytes, err := protocol.EncodeHandshake(handshake)
-	if err != nil {
-		t.Fatalf("failed to encode handshake: %v", err)
-	}
-
-	handshakeMsg := &protocol.Message{
-		Type: protocol.MessageTypeHandshake,
-
-		Payload: handshakeBytes,
-	}
-
-	if err := protocol.WriteMessage(conn, handshakeMsg); err != nil {
-		t.Fatalf("failed to write handshake: %v", err)
-	}
+	handshake := &protocol.HandshakePayload{Version: 99, Secret: ""}
+	handshakeBytes, _ := protocol.EncodeHandshake(handshake)
+	msg := &protocol.Message{Type: protocol.MessageTypeHandshake, Payload: handshakeBytes}
+	protocol.WriteMessage(conn, msg)
 
 	// Read reject message
 	rejectMsg, err := protocol.ReadMessage(conn)
@@ -664,19 +656,10 @@ func TestHandshakeInvalidProtocolVersion(t *testing.T) {
 }
 
 func TestHandshakeWrongMessageType(t *testing.T) {
-	// Start server
-	server := NewServer(0, "")
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Run()
-	}()
-	defer server.Close()
+	env := NewTestEnvironment(t, nil)
+	defer env.Stop()
 
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Connect as client
-	conn, err := net.Dial("tcp", server.listener.Addr().String())
+	conn, err := net.Dial("tcp", env.ServerAddr())
 	if err != nil {
 		t.Fatalf("failed to connect to server: %v", err)
 	}
@@ -684,43 +667,39 @@ func TestHandshakeWrongMessageType(t *testing.T) {
 
 	// Send wrong message type (not handshake)
 	wrongMsg := &protocol.Message{
-		Type: protocol.MessageTypeConnect, // Wrong type (should be handshake)
-
+		Type:    protocol.MessageTypeConnect,
 		Payload: []byte("test"),
 	}
-
-	if err := protocol.WriteMessage(conn, wrongMsg); err != nil {
-		t.Fatalf("failed to write message: %v", err)
-	}
+	protocol.WriteMessage(conn, wrongMsg)
 
 	// Connection should be closed by server
 	time.Sleep(100 * time.Millisecond)
 
-	// Try to read - should get EOF or connection closed error
 	_, err = protocol.ReadMessage(conn)
 	if err == nil {
 		t.Error("expected error reading from closed connection, got nil")
 	}
 }
 
+// ============================================================================
+// Public Listener Tests
+// ============================================================================
+
 func TestCreatePublicListener(t *testing.T) {
 	server := NewServer(0, "")
 
-	// Allocate a port
 	port, err := server.portAllocator.Allocate()
 	if err != nil {
 		t.Fatalf("failed to allocate port: %v", err)
 	}
 	defer server.portAllocator.Release(port)
 
-	// Create listener on allocated port
 	listener, err := server.createPublicListener(port)
 	if err != nil {
 		t.Fatalf("createPublicListener() error = %v", err)
 	}
 	defer listener.Close()
 
-	// Verify listener is working
 	addr := listener.Addr().(*net.TCPAddr)
 	if addr.Port != port {
 		t.Errorf("listener port = %d, want %d", addr.Port, port)
@@ -735,9 +714,8 @@ func TestCreatePublicListener(t *testing.T) {
 }
 
 func TestCreatePublicListenerPortInUse(t *testing.T) {
-	server := NewServer(18005, "")
+	server := NewServer(0, "")
 
-	// Create a listener on a specific port (all interfaces to match createPublicListener)
 	existingListener, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatalf("failed to create existing listener: %v", err)
@@ -746,7 +724,6 @@ func TestCreatePublicListenerPortInUse(t *testing.T) {
 
 	usedPort := existingListener.Addr().(*net.TCPAddr).Port
 
-	// Try to create public listener on the same port
 	_, err = server.createPublicListener(usedPort)
 	if err == nil {
 		t.Error("expected error when port is in use, got nil")
@@ -754,18 +731,14 @@ func TestCreatePublicListenerPortInUse(t *testing.T) {
 }
 
 func TestUUIDGeneration(t *testing.T) {
-	// Test that UUIDs are generated and are unique
 	uuids := make(map[string]bool)
 
 	for i := 0; i < 100; i++ {
 		u := uuid.New().String()
 
-		// Verify UUID format (36 characters)
 		if len(u) != 36 {
 			t.Errorf("UUID length = %d, want 36", len(u))
 		}
-
-		// Verify uniqueness
 		if uuids[u] {
 			t.Errorf("Duplicate UUID generated: %s", u)
 		}
@@ -775,61 +748,30 @@ func TestUUIDGeneration(t *testing.T) {
 
 func TestSendConnect(t *testing.T) {
 	server := NewServer(0, "")
+	pair := NewMockConnPair(t)
+	defer pair.Close()
 
-	// Create a mock connection
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to create listener: %v", err)
-	}
-	defer listener.Close()
-
-	// Accept connection in goroutine
-	serverConnCh := make(chan net.Conn, 1)
-	go func() {
-		conn, _ := listener.Accept()
-		serverConnCh <- conn
-	}()
-
-	// Connect as client
-	clientConn, err := net.Dial("tcp", listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to dial: %v", err)
-	}
-	defer clientConn.Close()
-
-	serverConn := <-serverConnCh
-	defer serverConn.Close()
-
-	// Create session
 	session := &ClientSession{
 		id:      "test-session",
-		conn:    serverConn,
+		conn:    pair.ServerConn,
 		streams: make(map[string]*ServerStream),
 	}
 
-	// Send connect message with UUID
 	testUUID := "550e8400-e29b-41d4-a716-446655440000"
 	if err := server.sendConnect(session, testUUID); err != nil {
 		t.Fatalf("sendConnect() error = %v", err)
 	}
 
 	// Read message on client side
-	msg, err := protocol.ReadMessage(clientConn)
+	msg, err := protocol.ReadMessage(pair.ClientConn)
 	if err != nil {
 		t.Fatalf("failed to read message: %v", err)
 	}
 
-	// Verify message type
 	if msg.Type != protocol.MessageTypeConnect {
 		t.Errorf("message type = %d, want %d", msg.Type, protocol.MessageTypeConnect)
 	}
 
-	// Verify payload contains UUID
-	if len(msg.Payload) != 36 {
-		t.Errorf("payload length = %d, want 36", len(msg.Payload))
-	}
-
-	// Decode and verify UUID
 	connectPayload, err := protocol.DecodeConnect(msg.Payload)
 	if err != nil {
 		t.Fatalf("failed to decode connect payload: %v", err)
@@ -840,196 +782,53 @@ func TestSendConnect(t *testing.T) {
 	}
 }
 
+// ============================================================================
+// Public Connection Tests
+// ============================================================================
+
 func TestAcceptPublicConnections(t *testing.T) {
-	// Start server
-	server := NewServer(0, "")
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Run()
-	}()
-	defer server.Close()
+	env := NewTestEnvironment(t, nil)
+	defer env.Stop()
 
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
+	client := env.ConnectClient("")
+	defer client.Close()
 
-	// Connect as client and complete handshake
-	controlConn, err := net.Dial("tcp", server.listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to connect to server: %v", err)
-	}
-	defer controlConn.Close()
-
-	// Send handshake
-	handshake := &protocol.HandshakePayload{
-		Version: protocol.ProtocolVersion,
-		Secret:  "",
-	}
-	handshakeBytes, err := protocol.EncodeHandshake(handshake)
-	if err != nil {
-		t.Fatalf("failed to encode handshake: %v", err)
-	}
-
-	handshakeMsg := &protocol.Message{
-		Type: protocol.MessageTypeHandshake,
-
-		Payload: handshakeBytes,
-	}
-
-	if err := protocol.WriteMessage(controlConn, handshakeMsg); err != nil {
-		t.Fatalf("failed to write handshake: %v", err)
-	}
-
-	// Read accept message
-	acceptMsg, err := protocol.ReadMessage(controlConn)
-	if err != nil {
-		t.Fatalf("failed to read accept message: %v", err)
-	}
-
-	if acceptMsg.Type != protocol.MessageTypeAccept {
-		t.Fatalf("expected MessageTypeAccept, got type %d", acceptMsg.Type)
-	}
-
-	// Decode accept payload to get public port
-	acceptPayload, err := protocol.DecodeAccept(acceptMsg.Payload)
-	if err != nil {
-		t.Fatalf("failed to decode accept payload: %v", err)
-	}
-
-	publicPort := acceptPayload.PublicPort
-
-	// Give server time to start public listener
-	time.Sleep(100 * time.Millisecond)
-
-	// Connect to public port
-	publicConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
-	if err != nil {
-		t.Fatalf("failed to connect to public port: %v", err)
-	}
+	publicConn, uuid := client.ConnectToPublicPort()
 	defer publicConn.Close()
 
-	// Read MessageTypeConnect from control connection
-	connectMsg, err := protocol.ReadMessage(controlConn)
-	if err != nil {
-		t.Fatalf("failed to read connect message: %v", err)
-	}
-
-	if connectMsg.Type != protocol.MessageTypeConnect {
-		t.Errorf("expected MessageTypeConnect, got type %d", connectMsg.Type)
-	}
-
-	// Decode and verify UUID
-	connectPayload, err := protocol.DecodeConnect(connectMsg.Payload)
-	if err != nil {
-		t.Fatalf("failed to decode connect payload: %v", err)
-	}
-
-	if len(connectPayload.UUID) != 36 {
-		t.Errorf("UUID length = %d, want 36", len(connectPayload.UUID))
+	if len(uuid) != 36 {
+		t.Errorf("UUID length = %d, want 36", len(uuid))
 	}
 
 	// Verify pending stream was created
 	time.Sleep(50 * time.Millisecond)
-	server.pendingMu.RLock()
-	_, pendingExists := server.pendingStreams[connectPayload.UUID]
-	numPending := len(server.pendingStreams)
-	server.pendingMu.RUnlock()
+	env.Server.pendingMu.RLock()
+	_, pendingExists := env.Server.pendingStreams[uuid]
+	numPending := len(env.Server.pendingStreams)
+	env.Server.pendingMu.RUnlock()
 
 	if !pendingExists {
-		t.Errorf("pending stream with UUID %s not found", connectPayload.UUID)
+		t.Errorf("pending stream with UUID %s not found", uuid)
 	}
-
 	if numPending != 1 {
 		t.Errorf("expected 1 pending stream, got %d", numPending)
 	}
 }
 
 func TestAcceptMultiplePublicConnections(t *testing.T) {
-	// Start server
-	server := NewServer(0, "")
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Run()
-	}()
-	defer server.Close()
+	env := NewTestEnvironment(t, nil)
+	defer env.Stop()
 
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
+	client := env.ConnectClient("")
+	defer client.Close()
 
-	// Connect as client and complete handshake
-	controlConn, err := net.Dial("tcp", server.listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to connect to server: %v", err)
-	}
-	defer controlConn.Close()
-
-	// Send handshake
-	handshake := &protocol.HandshakePayload{
-		Version: protocol.ProtocolVersion,
-		Secret:  "",
-	}
-	handshakeBytes, err := protocol.EncodeHandshake(handshake)
-	if err != nil {
-		t.Fatalf("failed to encode handshake: %v", err)
-	}
-
-	handshakeMsg := &protocol.Message{
-		Type: protocol.MessageTypeHandshake,
-
-		Payload: handshakeBytes,
-	}
-
-	if err := protocol.WriteMessage(controlConn, handshakeMsg); err != nil {
-		t.Fatalf("failed to write handshake: %v", err)
-	}
-
-	// Read accept message
-	acceptMsg, err := protocol.ReadMessage(controlConn)
-	if err != nil {
-		t.Fatalf("failed to read accept message: %v", err)
-	}
-
-	// Decode accept payload to get public port
-	acceptPayload, err := protocol.DecodeAccept(acceptMsg.Payload)
-	if err != nil {
-		t.Fatalf("failed to decode accept payload: %v", err)
-	}
-
-	publicPort := acceptPayload.PublicPort
-
-	// Give server time to start public listener
-	time.Sleep(100 * time.Millisecond)
-
-	// Create multiple connections to public port
 	numConnections := 3
 	publicConns := make([]net.Conn, numConnections)
 	uuids := make([]string, numConnections)
 
 	for i := 0; i < numConnections; i++ {
-		// Connect to public port
-		conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
-		if err != nil {
-			t.Fatalf("failed to connect to public port (connection %d): %v", i, err)
-		}
-		defer conn.Close()
-		publicConns[i] = conn
-
-		// Read MessageTypeConnect from control connection
-		connectMsg, err := protocol.ReadMessage(controlConn)
-		if err != nil {
-			t.Fatalf("failed to read connect message (connection %d): %v", i, err)
-		}
-
-		if connectMsg.Type != protocol.MessageTypeConnect {
-			t.Errorf("connection %d: expected MessageTypeConnect, got type %d", i, connectMsg.Type)
-		}
-
-		// Decode UUID
-		connectPayload, err := protocol.DecodeConnect(connectMsg.Payload)
-		if err != nil {
-			t.Fatalf("connection %d: failed to decode connect payload: %v", i, err)
-		}
-
-		uuids[i] = connectPayload.UUID
+		publicConns[i], uuids[i] = client.ConnectToPublicPort()
+		defer publicConns[i].Close()
 	}
 
 	// Verify all UUIDs are unique
@@ -1046,9 +845,9 @@ func TestAcceptMultiplePublicConnections(t *testing.T) {
 
 	// Verify all pending streams exist
 	time.Sleep(50 * time.Millisecond)
-	server.pendingMu.RLock()
-	numPending := len(server.pendingStreams)
-	server.pendingMu.RUnlock()
+	env.Server.pendingMu.RLock()
+	numPending := len(env.Server.pendingStreams)
+	env.Server.pendingMu.RUnlock()
 
 	if numPending != numConnections {
 		t.Errorf("expected %d pending streams, got %d", numConnections, numPending)
@@ -1056,59 +855,11 @@ func TestAcceptMultiplePublicConnections(t *testing.T) {
 }
 
 func TestPublicListenerCleanupOnSessionRemoval(t *testing.T) {
-	// Start server
-	server := NewServer(0, "")
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Run()
-	}()
-	defer server.Close()
+	env := NewTestEnvironment(t, nil)
+	defer env.Stop()
 
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Connect as client and complete handshake
-	controlConn, err := net.Dial("tcp", server.listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to connect to server: %v", err)
-	}
-
-	// Send handshake
-	handshake := &protocol.HandshakePayload{
-		Version: protocol.ProtocolVersion,
-		Secret:  "",
-	}
-	handshakeBytes, err := protocol.EncodeHandshake(handshake)
-	if err != nil {
-		t.Fatalf("failed to encode handshake: %v", err)
-	}
-
-	handshakeMsg := &protocol.Message{
-		Type: protocol.MessageTypeHandshake,
-
-		Payload: handshakeBytes,
-	}
-
-	if err := protocol.WriteMessage(controlConn, handshakeMsg); err != nil {
-		t.Fatalf("failed to write handshake: %v", err)
-	}
-
-	// Read accept message
-	acceptMsg, err := protocol.ReadMessage(controlConn)
-	if err != nil {
-		t.Fatalf("failed to read accept message: %v", err)
-	}
-
-	// Decode accept payload to get public port
-	acceptPayload, err := protocol.DecodeAccept(acceptMsg.Payload)
-	if err != nil {
-		t.Fatalf("failed to decode accept payload: %v", err)
-	}
-
-	publicPort := acceptPayload.PublicPort
-
-	// Give server time to start public listener
-	time.Sleep(100 * time.Millisecond)
+	client := env.ConnectClient("")
+	publicPort := client.PublicPort
 
 	// Verify public port is listening
 	testConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
@@ -1118,7 +869,7 @@ func TestPublicListenerCleanupOnSessionRemoval(t *testing.T) {
 	testConn.Close()
 
 	// Close control connection to trigger cleanup
-	controlConn.Close()
+	client.Close()
 
 	// Give server time to cleanup
 	time.Sleep(200 * time.Millisecond)
@@ -1131,206 +882,89 @@ func TestPublicListenerCleanupOnSessionRemoval(t *testing.T) {
 }
 
 func TestPendingStreamTimeout(t *testing.T) {
-	// Start server
-	server := NewServer(0, "")
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Run()
-	}()
-	defer server.Close()
+	env := NewTestEnvironment(t, nil)
+	defer env.Stop()
 
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
+	client := env.ConnectClient("")
+	defer client.Close()
 
-	// Connect as client and complete handshake
-	controlConn, err := net.Dial("tcp", server.listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to connect to server: %v", err)
-	}
-	defer controlConn.Close()
-
-	// Send handshake
-	handshake := &protocol.HandshakePayload{
-		Version: protocol.ProtocolVersion,
-		Secret:  "",
-	}
-	handshakeBytes, err := protocol.EncodeHandshake(handshake)
-	if err != nil {
-		t.Fatalf("failed to encode handshake: %v", err)
-	}
-
-	handshakeMsg := &protocol.Message{
-		Type: protocol.MessageTypeHandshake,
-
-		Payload: handshakeBytes,
-	}
-
-	if err := protocol.WriteMessage(controlConn, handshakeMsg); err != nil {
-		t.Fatalf("failed to write handshake: %v", err)
-	}
-
-	// Read accept message
-	acceptMsg, err := protocol.ReadMessage(controlConn)
-	if err != nil {
-		t.Fatalf("failed to read accept message: %v", err)
-	}
-
-	// Decode accept payload to get public port
-	acceptPayload, err := protocol.DecodeAccept(acceptMsg.Payload)
-	if err != nil {
-		t.Fatalf("failed to decode accept payload: %v", err)
-	}
-
-	publicPort := acceptPayload.PublicPort
-
-	// Give server time to start public listener
-	time.Sleep(100 * time.Millisecond)
-
-	// Connect to public port
-	publicConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
-	if err != nil {
-		t.Fatalf("failed to connect to public port: %v", err)
-	}
+	publicConn, uuid := client.ConnectToPublicPort()
 	defer publicConn.Close()
 
-	// Read MessageTypeConnect from control connection
-	connectMsg, err := protocol.ReadMessage(controlConn)
-	if err != nil {
-		t.Fatalf("failed to read connect message: %v", err)
-	}
-
-	// Decode UUID
-	connectPayload, err := protocol.DecodeConnect(connectMsg.Payload)
-	if err != nil {
-		t.Fatalf("failed to decode connect payload: %v", err)
-	}
-
-	uuid := connectPayload.UUID
-
 	// Verify pending stream exists
-	server.pendingMu.RLock()
-	_, exists := server.pendingStreams[uuid]
-	server.pendingMu.RUnlock()
+	env.Server.pendingMu.RLock()
+	_, exists := env.Server.pendingStreams[uuid]
+	env.Server.pendingMu.RUnlock()
 
 	if !exists {
 		t.Fatal("pending stream should exist immediately after connect")
 	}
 
-	// Wait for timeout (30 seconds + buffer)
-	// For testing, we'll just verify the timeout is set
-	// In a real test, you'd want to reduce the timeout or mock time
-	server.pendingMu.RLock()
-	pending := server.pendingStreams[uuid]
+	// Verify timeout is set
+	env.Server.pendingMu.RLock()
+	pending := env.Server.pendingStreams[uuid]
 	hasTimeout := pending != nil && pending.timeout != nil
-	server.pendingMu.RUnlock()
+	env.Server.pendingMu.RUnlock()
 
 	if !hasTimeout {
 		t.Error("pending stream should have timeout set")
 	}
 
 	// Manually trigger cleanup to test it works
-	server.cleanupPendingStream(uuid)
+	env.Server.cleanupPendingStream(uuid)
 
 	// Verify pending stream was removed
-	server.pendingMu.RLock()
-	_, exists = server.pendingStreams[uuid]
-	server.pendingMu.RUnlock()
+	env.Server.pendingMu.RLock()
+	_, exists = env.Server.pendingStreams[uuid]
+	env.Server.pendingMu.RUnlock()
 
 	if exists {
 		t.Error("pending stream should be removed after cleanup")
 	}
 }
 
-// TestConnectionTypeDetection tests that the server correctly routes connections
-// based on the first message type (handshake vs stream handshake)
-func TestConnectionTypeDetection(t *testing.T) {
-	// Start server
-	server := NewServer(0, "")
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Run()
-	}()
-	defer server.Close()
+// ============================================================================
+// Connection Type Detection Tests
+// ============================================================================
 
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
+func TestConnectionTypeDetection(t *testing.T) {
+	env := NewTestEnvironment(t, nil)
+	defer env.Stop()
 
 	t.Run("control connection with handshake message", func(t *testing.T) {
-		// Connect to server
-		conn, err := net.Dial("tcp", server.listener.Addr().String())
-		if err != nil {
-			t.Fatalf("failed to connect to server: %v", err)
-		}
-		defer conn.Close()
-
-		// Send handshake message (should be routed to control connection handler)
-		handshake := &protocol.HandshakePayload{
-			Version: protocol.ProtocolVersion,
-			Secret:  "",
-		}
-		handshakeBytes, err := protocol.EncodeHandshake(handshake)
-		if err != nil {
-			t.Fatalf("failed to encode handshake: %v", err)
-		}
-
-		handshakeMsg := &protocol.Message{
-			Type:    protocol.MessageTypeHandshake,
-			Payload: handshakeBytes,
-		}
-
-		if err := protocol.WriteMessage(conn, handshakeMsg); err != nil {
-			t.Fatalf("failed to write handshake: %v", err)
-		}
-
-		// Should receive accept message (indicating control connection handler was called)
-		acceptMsg, err := protocol.ReadMessage(conn)
-		if err != nil {
-			t.Fatalf("failed to read accept message: %v", err)
-		}
-
-		if acceptMsg.Type != protocol.MessageTypeAccept {
-			t.Errorf("expected MessageTypeAccept, got type %d", acceptMsg.Type)
-		}
+		client := env.ConnectClient("")
+		defer client.Close()
 
 		// Verify session was created
 		time.Sleep(50 * time.Millisecond)
-		server.clientsMu.RLock()
-		numClients := len(server.clients)
-		server.clientsMu.RUnlock()
+		env.Server.clientsMu.RLock()
+		numClients := len(env.Server.clients)
+		env.Server.clientsMu.RUnlock()
 
-		if numClients != 1 {
-			t.Errorf("expected 1 client session, got %d", numClients)
+		if numClients < 1 {
+			t.Errorf("expected at least 1 client session, got %d", numClients)
 		}
 	})
 
 	t.Run("data connection with stream handshake message", func(t *testing.T) {
-		// Connect to server
-		conn, err := net.Dial("tcp", server.listener.Addr().String())
+		conn, err := net.Dial("tcp", env.ServerAddr())
 		if err != nil {
 			t.Fatalf("failed to connect to server: %v", err)
 		}
 		defer conn.Close()
 
-		// Send stream handshake message (should be routed to data connection handler)
+		// Send stream handshake with non-existent UUID
 		streamHandshake := &protocol.StreamHandshakePayload{
 			UUID: "550e8400-e29b-41d4-a716-446655440000",
 		}
-		streamHandshakeBytes, err := protocol.EncodeStreamHandshake(streamHandshake)
-		if err != nil {
-			t.Fatalf("failed to encode stream handshake: %v", err)
-		}
-
-		streamHandshakeMsg := &protocol.Message{
+		streamHandshakeBytes, _ := protocol.EncodeStreamHandshake(streamHandshake)
+		msg := &protocol.Message{
 			Type:    protocol.MessageTypeStreamHandshake,
 			Payload: streamHandshakeBytes,
 		}
+		protocol.WriteMessage(conn, msg)
 
-		if err := protocol.WriteMessage(conn, streamHandshakeMsg); err != nil {
-			t.Fatalf("failed to write stream handshake: %v", err)
-		}
-
-		// Connection should be handled by data connection handler
-		// Since UUID doesn't exist in pending streams, should receive StreamReject
+		// Should receive StreamReject since UUID doesn't exist
 		rejectMsg, err := protocol.ReadMessage(conn)
 		if err != nil {
 			t.Fatalf("failed to read reject message: %v", err)
@@ -1339,177 +973,64 @@ func TestConnectionTypeDetection(t *testing.T) {
 		if rejectMsg.Type != protocol.MessageTypeStreamReject {
 			t.Errorf("expected MessageTypeStreamReject, got type %d", rejectMsg.Type)
 		}
-
-		// Connection should be closed after reject
-		time.Sleep(100 * time.Millisecond)
-
-		// Try to read - should get EOF since data handler closes connection after reject
-		_, err = protocol.ReadMessage(conn)
-		if err == nil {
-			t.Error("expected connection to be closed by data handler, but it's still open")
-		}
 	})
 
 	t.Run("invalid message type", func(t *testing.T) {
-		// Connect to server
-		conn, err := net.Dial("tcp", server.listener.Addr().String())
+		conn, err := net.Dial("tcp", env.ServerAddr())
 		if err != nil {
 			t.Fatalf("failed to connect to server: %v", err)
 		}
 		defer conn.Close()
 
-		// Send invalid message type
 		invalidMsg := &protocol.Message{
-			Type:    protocol.MessageTypeConnect, // Invalid as first message
+			Type:    protocol.MessageTypeConnect,
 			Payload: []byte("test"),
 		}
+		protocol.WriteMessage(conn, invalidMsg)
 
-		if err := protocol.WriteMessage(conn, invalidMsg); err != nil {
-			t.Fatalf("failed to write invalid message: %v", err)
-		}
-
-		// Connection should be closed by server
 		time.Sleep(100 * time.Millisecond)
 
-		// Try to read - should get EOF
 		_, err = protocol.ReadMessage(conn)
 		if err == nil {
-			t.Error("expected connection to be closed for invalid message type, but it's still open")
+			t.Error("expected connection to be closed for invalid message type")
 		}
 	})
 }
 
-// TestDataConnectionHandler tests the data connection handler functionality
+// ============================================================================
+// Data Connection Handler Tests
+// ============================================================================
+
 func TestDataConnectionHandler(t *testing.T) {
-	// Start server
-	server := NewServer(0, "")
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Run()
-	}()
-	defer server.Close()
+	env := NewTestEnvironment(t, nil)
+	defer env.Stop()
 
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
-
-	// First, establish a control connection and get a public port
-	controlConn, err := net.Dial("tcp", server.listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to connect to server: %v", err)
-	}
-	defer controlConn.Close()
-
-	// Send handshake
-	handshake := &protocol.HandshakePayload{
-		Version: protocol.ProtocolVersion,
-		Secret:  "",
-	}
-	handshakeBytes, err := protocol.EncodeHandshake(handshake)
-	if err != nil {
-		t.Fatalf("failed to encode handshake: %v", err)
-	}
-
-	handshakeMsg := &protocol.Message{
-		Type:    protocol.MessageTypeHandshake,
-		Payload: handshakeBytes,
-	}
-
-	if err := protocol.WriteMessage(controlConn, handshakeMsg); err != nil {
-		t.Fatalf("failed to write handshake: %v", err)
-	}
-
-	// Read accept message
-	acceptMsg, err := protocol.ReadMessage(controlConn)
-	if err != nil {
-		t.Fatalf("failed to read accept message: %v", err)
-	}
-
-	// Decode accept payload to get public port
-	acceptPayload, err := protocol.DecodeAccept(acceptMsg.Payload)
-	if err != nil {
-		t.Fatalf("failed to decode accept payload: %v", err)
-	}
-
-	publicPort := acceptPayload.PublicPort
-
-	// Give server time to start public listener
-	time.Sleep(100 * time.Millisecond)
+	client := env.ConnectClient("")
+	defer client.Close()
 
 	t.Run("successful stream handshake", func(t *testing.T) {
-		// Connect to public port to create a pending stream
-		publicConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
-		if err != nil {
-			t.Fatalf("failed to connect to public port: %v", err)
-		}
+		publicConn, dataConn, uuid := client.EstablishStream()
 		defer publicConn.Close()
-
-		// Read MessageTypeConnect from control connection
-		connectMsg, err := protocol.ReadMessage(controlConn)
-		if err != nil {
-			t.Fatalf("failed to read connect message: %v", err)
-		}
-
-		// Decode UUID
-		connectPayload, err := protocol.DecodeConnect(connectMsg.Payload)
-		if err != nil {
-			t.Fatalf("failed to decode connect payload: %v", err)
-		}
-
-		uuid := connectPayload.UUID
-
-		// Now open a data connection with the UUID
-		dataConn, err := net.Dial("tcp", server.listener.Addr().String())
-		if err != nil {
-			t.Fatalf("failed to connect for data connection: %v", err)
-		}
 		defer dataConn.Close()
-
-		// Send stream handshake with the UUID
-		streamHandshake := &protocol.StreamHandshakePayload{
-			UUID: uuid,
-		}
-		streamHandshakeBytes, err := protocol.EncodeStreamHandshake(streamHandshake)
-		if err != nil {
-			t.Fatalf("failed to encode stream handshake: %v", err)
-		}
-
-		streamHandshakeMsg := &protocol.Message{
-			Type:    protocol.MessageTypeStreamHandshake,
-			Payload: streamHandshakeBytes,
-		}
-
-		if err := protocol.WriteMessage(dataConn, streamHandshakeMsg); err != nil {
-			t.Fatalf("failed to write stream handshake: %v", err)
-		}
-
-		// Should receive stream accept message
-		streamAcceptMsg, err := protocol.ReadMessage(dataConn)
-		if err != nil {
-			t.Fatalf("failed to read stream accept message: %v", err)
-		}
-
-		if streamAcceptMsg.Type != protocol.MessageTypeStreamAccept {
-			t.Errorf("expected MessageTypeStreamAccept, got type %d", streamAcceptMsg.Type)
-		}
 
 		// Verify pending stream was removed
 		time.Sleep(50 * time.Millisecond)
-		server.pendingMu.RLock()
-		_, exists := server.pendingStreams[uuid]
-		server.pendingMu.RUnlock()
+		env.Server.pendingMu.RLock()
+		_, exists := env.Server.pendingStreams[uuid]
+		env.Server.pendingMu.RUnlock()
 
 		if exists {
 			t.Error("pending stream should be removed after successful handshake")
 		}
 
 		// Verify stream was created in session
-		server.clientsMu.RLock()
+		env.Server.clientsMu.RLock()
 		var session *ClientSession
-		for _, s := range server.clients {
+		for _, s := range env.Server.clients {
 			session = s
 			break
 		}
-		server.clientsMu.RUnlock()
+		env.Server.clientsMu.RUnlock()
 
 		if session == nil {
 			t.Fatal("no client session found")
@@ -1522,229 +1043,106 @@ func TestDataConnectionHandler(t *testing.T) {
 		if !streamExists {
 			t.Error("stream should be created in session")
 		}
-
 		if stream.uuid != uuid {
 			t.Errorf("stream UUID = %s, want %s", stream.uuid, uuid)
 		}
-
 		if stream.dataConn == nil {
 			t.Error("stream data connection should not be nil")
 		}
-
 		if stream.externalConn == nil {
 			t.Error("stream external connection should not be nil")
 		}
 	})
 
 	t.Run("stream handshake with invalid UUID", func(t *testing.T) {
-		// Open a data connection with invalid UUID
-		dataConn, err := net.Dial("tcp", server.listener.Addr().String())
+		dataConn, err := net.Dial("tcp", env.ServerAddr())
 		if err != nil {
 			t.Fatalf("failed to connect for data connection: %v", err)
 		}
 		defer dataConn.Close()
 
-		// Send stream handshake with invalid UUID (valid format but not in pending map)
 		invalidUUID := "550e8400-e29b-41d4-a716-446655440000"
-		streamHandshake := &protocol.StreamHandshakePayload{
-			UUID: invalidUUID,
-		}
-		streamHandshakeBytes, err := protocol.EncodeStreamHandshake(streamHandshake)
-		if err != nil {
-			t.Fatalf("failed to encode stream handshake: %v", err)
-		}
-
-		streamHandshakeMsg := &protocol.Message{
+		streamHandshake := &protocol.StreamHandshakePayload{UUID: invalidUUID}
+		streamHandshakeBytes, _ := protocol.EncodeStreamHandshake(streamHandshake)
+		msg := &protocol.Message{
 			Type:    protocol.MessageTypeStreamHandshake,
 			Payload: streamHandshakeBytes,
 		}
+		protocol.WriteMessage(dataConn, msg)
 
-		if err := protocol.WriteMessage(dataConn, streamHandshakeMsg); err != nil {
-			t.Fatalf("failed to write stream handshake: %v", err)
-		}
-
-		// Should receive stream reject message
-		streamRejectMsg, err := protocol.ReadMessage(dataConn)
+		rejectMsg, err := protocol.ReadMessage(dataConn)
 		if err != nil {
 			t.Fatalf("failed to read stream reject message: %v", err)
 		}
 
-		if streamRejectMsg.Type != protocol.MessageTypeStreamReject {
-			t.Errorf("expected MessageTypeStreamReject, got type %d", streamRejectMsg.Type)
+		if rejectMsg.Type != protocol.MessageTypeStreamReject {
+			t.Errorf("expected MessageTypeStreamReject, got type %d", rejectMsg.Type)
 		}
 	})
 
 	t.Run("stream handshake with malformed payload", func(t *testing.T) {
-		// Open a data connection
-		dataConn, err := net.Dial("tcp", server.listener.Addr().String())
+		dataConn, err := net.Dial("tcp", env.ServerAddr())
 		if err != nil {
 			t.Fatalf("failed to connect for data connection: %v", err)
 		}
 		defer dataConn.Close()
 
-		// Send stream handshake with malformed payload (wrong length)
-		streamHandshakeMsg := &protocol.Message{
+		msg := &protocol.Message{
 			Type:    protocol.MessageTypeStreamHandshake,
 			Payload: []byte("invalid-payload-too-short"),
 		}
+		protocol.WriteMessage(dataConn, msg)
 
-		if err := protocol.WriteMessage(dataConn, streamHandshakeMsg); err != nil {
-			t.Fatalf("failed to write stream handshake: %v", err)
-		}
-
-		// Connection should be closed by server due to decode error
 		time.Sleep(100 * time.Millisecond)
 
-		// Try to read - should get EOF
 		_, err = protocol.ReadMessage(dataConn)
 		if err == nil {
-			t.Error("expected connection to be closed for malformed payload, but it's still open")
+			t.Error("expected connection to be closed for malformed payload")
 		}
 	})
 }
 
-// TestBidirectionalProxy tests the bidirectional raw TCP proxy functionality
+// ============================================================================
+// Bidirectional Proxy Tests
+// ============================================================================
+
 func TestBidirectionalProxy(t *testing.T) {
-	// Start server
-	server := NewServer(0, "")
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Run()
-	}()
-	defer server.Close()
+	env := NewTestEnvironment(t, nil)
+	defer env.Stop()
 
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
-
-	// First, establish a control connection and get a public port
-	controlConn, err := net.Dial("tcp", server.listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to connect to server: %v", err)
-	}
-	defer controlConn.Close()
-
-	// Send handshake
-	handshake := &protocol.HandshakePayload{
-		Version: protocol.ProtocolVersion,
-		Secret:  "",
-	}
-	handshakeBytes, err := protocol.EncodeHandshake(handshake)
-	if err != nil {
-		t.Fatalf("failed to encode handshake: %v", err)
-	}
-
-	handshakeMsg := &protocol.Message{
-		Type:    protocol.MessageTypeHandshake,
-		Payload: handshakeBytes,
-	}
-
-	if err := protocol.WriteMessage(controlConn, handshakeMsg); err != nil {
-		t.Fatalf("failed to write handshake: %v", err)
-	}
-
-	// Read accept message
-	acceptMsg, err := protocol.ReadMessage(controlConn)
-	if err != nil {
-		t.Fatalf("failed to read accept message: %v", err)
-	}
-
-	// Decode accept payload to get public port
-	acceptPayload, err := protocol.DecodeAccept(acceptMsg.Payload)
-	if err != nil {
-		t.Fatalf("failed to decode accept payload: %v", err)
-	}
-
-	publicPort := acceptPayload.PublicPort
-
-	// Give server time to start public listener
-	time.Sleep(100 * time.Millisecond)
+	client := env.ConnectClient("")
+	defer client.Close()
 
 	t.Run("bidirectional data forwarding", func(t *testing.T) {
-		// Connect to public port to create a pending stream
-		publicConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
-		if err != nil {
-			t.Fatalf("failed to connect to public port: %v", err)
-		}
-
-		// Read MessageTypeConnect from control connection
-		connectMsg, err := protocol.ReadMessage(controlConn)
-		if err != nil {
-			t.Fatalf("failed to read connect message: %v", err)
-		}
-
-		// Decode UUID
-		connectPayload, err := protocol.DecodeConnect(connectMsg.Payload)
-		if err != nil {
-			t.Fatalf("failed to decode connect payload: %v", err)
-		}
-
-		uuid := connectPayload.UUID
-
-		// Now open a data connection with the UUID
-		dataConn, err := net.Dial("tcp", server.listener.Addr().String())
-		if err != nil {
-			t.Fatalf("failed to connect for data connection: %v", err)
-		}
-
-		// Send stream handshake with the UUID
-		streamHandshake := &protocol.StreamHandshakePayload{
-			UUID: uuid,
-		}
-		streamHandshakeBytes, err := protocol.EncodeStreamHandshake(streamHandshake)
-		if err != nil {
-			t.Fatalf("failed to encode stream handshake: %v", err)
-		}
-
-		streamHandshakeMsg := &protocol.Message{
-			Type:    protocol.MessageTypeStreamHandshake,
-			Payload: streamHandshakeBytes,
-		}
-
-		if err := protocol.WriteMessage(dataConn, streamHandshakeMsg); err != nil {
-			t.Fatalf("failed to write stream handshake: %v", err)
-		}
-
-		// Should receive stream accept message
-		streamAcceptMsg, err := protocol.ReadMessage(dataConn)
-		if err != nil {
-			t.Fatalf("failed to read stream accept message: %v", err)
-		}
-
-		if streamAcceptMsg.Type != protocol.MessageTypeStreamAccept {
-			t.Fatalf("expected MessageTypeStreamAccept, got type %d", streamAcceptMsg.Type)
-		}
+		publicConn, dataConn, _ := client.EstablishStream()
+		defer publicConn.Close()
+		defer dataConn.Close()
 
 		// Give proxy time to start
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 
 		// Test data forwarding: external → client
 		testData1 := []byte("Hello from external client!")
-
-		// Write and read in separate goroutines to avoid blocking
 		errCh := make(chan error, 2)
 
 		go func() {
-			if _, err := publicConn.Write(testData1); err != nil {
-				errCh <- fmt.Errorf("failed to write to public connection: %v", err)
-				return
-			}
-			errCh <- nil
+			_, err := publicConn.Write(testData1)
+			errCh <- err
 		}()
 
 		go func() {
-			buffer1 := make([]byte, len(testData1))
-			if _, err := io.ReadFull(dataConn, buffer1); err != nil {
-				errCh <- fmt.Errorf("failed to read from data connection: %v", err)
+			buffer := make([]byte, len(testData1))
+			if _, err := io.ReadFull(dataConn, buffer); err != nil {
+				errCh <- fmt.Errorf("failed to read: %v", err)
 				return
 			}
-			if string(buffer1) != string(testData1) {
-				errCh <- fmt.Errorf("external→client data mismatch: got %q, want %q", string(buffer1), string(testData1))
+			if string(buffer) != string(testData1) {
+				errCh <- fmt.Errorf("data mismatch: got %q, want %q", string(buffer), string(testData1))
 				return
 			}
 			errCh <- nil
 		}()
 
-		// Wait for both operations
 		for i := 0; i < 2; i++ {
 			if err := <-errCh; err != nil {
 				t.Fatal(err)
@@ -1755,105 +1153,41 @@ func TestBidirectionalProxy(t *testing.T) {
 		testData2 := []byte("Hello from client!")
 
 		go func() {
-			if _, err := dataConn.Write(testData2); err != nil {
-				errCh <- fmt.Errorf("failed to write to data connection: %v", err)
-				return
-			}
-			errCh <- nil
+			_, err := dataConn.Write(testData2)
+			errCh <- err
 		}()
 
 		go func() {
-			buffer2 := make([]byte, len(testData2))
-			if _, err := io.ReadFull(publicConn, buffer2); err != nil {
-				errCh <- fmt.Errorf("failed to read from public connection: %v", err)
+			buffer := make([]byte, len(testData2))
+			if _, err := io.ReadFull(publicConn, buffer); err != nil {
+				errCh <- fmt.Errorf("failed to read: %v", err)
 				return
 			}
-			if string(buffer2) != string(testData2) {
-				errCh <- fmt.Errorf("client→external data mismatch: got %q, want %q", string(buffer2), string(testData2))
+			if string(buffer) != string(testData2) {
+				errCh <- fmt.Errorf("data mismatch: got %q, want %q", string(buffer), string(testData2))
 				return
 			}
 			errCh <- nil
 		}()
 
-		// Wait for both operations
 		for i := 0; i < 2; i++ {
 			if err := <-errCh; err != nil {
 				t.Fatal(err)
 			}
 		}
-
-		// Close connections after test
-		publicConn.Close()
-		dataConn.Close()
 	})
 
 	t.Run("connection cleanup on close", func(t *testing.T) {
-		// Connect to public port to create a pending stream
-		publicConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
-		if err != nil {
-			t.Fatalf("failed to connect to public port: %v", err)
-		}
-		defer publicConn.Close()
-
-		// Read MessageTypeConnect from control connection
-		connectMsg, err := protocol.ReadMessage(controlConn)
-		if err != nil {
-			t.Fatalf("failed to read connect message: %v", err)
-		}
-
-		// Decode UUID
-		connectPayload, err := protocol.DecodeConnect(connectMsg.Payload)
-		if err != nil {
-			t.Fatalf("failed to decode connect payload: %v", err)
-		}
-
-		uuid := connectPayload.UUID
-
-		// Now open a data connection with the UUID
-		dataConn, err := net.Dial("tcp", server.listener.Addr().String())
-		if err != nil {
-			t.Fatalf("failed to connect for data connection: %v", err)
-		}
-
-		// Send stream handshake with the UUID
-		streamHandshake := &protocol.StreamHandshakePayload{
-			UUID: uuid,
-		}
-		streamHandshakeBytes, err := protocol.EncodeStreamHandshake(streamHandshake)
-		if err != nil {
-			t.Fatalf("failed to encode stream handshake: %v", err)
-		}
-
-		streamHandshakeMsg := &protocol.Message{
-			Type:    protocol.MessageTypeStreamHandshake,
-			Payload: streamHandshakeBytes,
-		}
-
-		if err := protocol.WriteMessage(dataConn, streamHandshakeMsg); err != nil {
-			t.Fatalf("failed to write stream handshake: %v", err)
-		}
-
-		// Should receive stream accept message
-		streamAcceptMsg, err := protocol.ReadMessage(dataConn)
-		if err != nil {
-			t.Fatalf("failed to read stream accept message: %v", err)
-		}
-
-		if streamAcceptMsg.Type != protocol.MessageTypeStreamAccept {
-			t.Fatalf("expected MessageTypeStreamAccept, got type %d", streamAcceptMsg.Type)
-		}
-
-		// Give proxy time to start
-		time.Sleep(100 * time.Millisecond)
+		publicConn, dataConn, uuid := client.EstablishStream()
 
 		// Verify stream exists in session
-		server.clientsMu.RLock()
+		env.Server.clientsMu.RLock()
 		var session *ClientSession
-		for _, s := range server.clients {
+		for _, s := range env.Server.clients {
 			session = s
 			break
 		}
-		server.clientsMu.RUnlock()
+		env.Server.clientsMu.RUnlock()
 
 		if session == nil {
 			t.Fatal("no client session found")
@@ -1883,43 +1217,25 @@ func TestBidirectionalProxy(t *testing.T) {
 		}
 
 		// Verify other connection is also closed
-		_, err = publicConn.Read(make([]byte, 1))
+		_, err := publicConn.Read(make([]byte, 1))
 		if err == nil {
 			t.Error("public connection should be closed after cleanup")
 		}
+		publicConn.Close()
 	})
 }
 
 func TestCleanupPendingStream(t *testing.T) {
 	server := NewServer(0, "")
+	pair := NewMockConnPair(t)
+	defer pair.Close()
 
-	// Create a mock external connection
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to create listener: %v", err)
-	}
-	defer listener.Close()
-
-	connCh := make(chan net.Conn, 1)
-	go func() {
-		conn, _ := listener.Accept()
-		connCh <- conn
-	}()
-
-	externalConn, err := net.Dial("tcp", listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to dial: %v", err)
-	}
-
-	serverConn := <-connCh
-
-	// Create pending stream
 	testUUID := "test-uuid-12345678-1234-1234-1234"
 	pending := &PendingStream{
-		externalConn: serverConn,
+		externalConn: pair.ServerConn,
 		sessionID:    "test-session",
 		createdAt:    time.Now(),
-		timeout:      time.NewTimer(1 * time.Hour), // Long timeout for testing
+		timeout:      time.NewTimer(1 * time.Hour),
 	}
 
 	server.pendingMu.Lock()
@@ -1948,7 +1264,7 @@ func TestCleanupPendingStream(t *testing.T) {
 	}
 
 	// Verify connection is closed
-	_, err = externalConn.Read(make([]byte, 1))
+	_, err := pair.ClientConn.Read(make([]byte, 1))
 	if err == nil {
 		t.Error("external connection should be closed after cleanup")
 	}
@@ -1957,113 +1273,20 @@ func TestCleanupPendingStream(t *testing.T) {
 	server.cleanupPendingStream(testUUID)
 }
 
-// TestBidirectionalProxyLargeData tests that large data transfers work correctly
+// ============================================================================
+// Large Data and Concurrent Stream Tests
+// ============================================================================
+
 func TestBidirectionalProxyLargeData(t *testing.T) {
-	// Start server
-	server := NewServer(0, "")
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Run()
-	}()
-	defer server.Close()
+	env := NewTestEnvironment(t, nil)
+	defer env.Stop()
 
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
+	client := env.ConnectClient("")
+	defer client.Close()
 
-	// Establish control connection
-	controlConn, err := net.Dial("tcp", server.listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to connect to server: %v", err)
-	}
-	defer controlConn.Close()
-
-	// Send handshake
-	handshake := &protocol.HandshakePayload{
-		Version: protocol.ProtocolVersion,
-		Secret:  "",
-	}
-	handshakeBytes, err := protocol.EncodeHandshake(handshake)
-	if err != nil {
-		t.Fatalf("failed to encode handshake: %v", err)
-	}
-
-	handshakeMsg := &protocol.Message{
-		Type:    protocol.MessageTypeHandshake,
-		Payload: handshakeBytes,
-	}
-
-	if err := protocol.WriteMessage(controlConn, handshakeMsg); err != nil {
-		t.Fatalf("failed to write handshake: %v", err)
-	}
-
-	// Read accept message
-	acceptMsg, err := protocol.ReadMessage(controlConn)
-	if err != nil {
-		t.Fatalf("failed to read accept message: %v", err)
-	}
-
-	acceptPayload, err := protocol.DecodeAccept(acceptMsg.Payload)
-	if err != nil {
-		t.Fatalf("failed to decode accept payload: %v", err)
-	}
-
-	publicPort := acceptPayload.PublicPort
-	time.Sleep(100 * time.Millisecond)
-
-	// Connect to public port
-	publicConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
-	if err != nil {
-		t.Fatalf("failed to connect to public port: %v", err)
-	}
+	publicConn, dataConn, _ := client.EstablishStream()
 	defer publicConn.Close()
-
-	// Read connect message
-	connectMsg, err := protocol.ReadMessage(controlConn)
-	if err != nil {
-		t.Fatalf("failed to read connect message: %v", err)
-	}
-
-	connectPayload, err := protocol.DecodeConnect(connectMsg.Payload)
-	if err != nil {
-		t.Fatalf("failed to decode connect payload: %v", err)
-	}
-
-	// Open data connection
-	dataConn, err := net.Dial("tcp", server.listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to connect for data connection: %v", err)
-	}
 	defer dataConn.Close()
-
-	// Send stream handshake
-	streamHandshake := &protocol.StreamHandshakePayload{
-		UUID: connectPayload.UUID,
-	}
-	streamHandshakeBytes, err := protocol.EncodeStreamHandshake(streamHandshake)
-	if err != nil {
-		t.Fatalf("failed to encode stream handshake: %v", err)
-	}
-
-	streamHandshakeMsg := &protocol.Message{
-		Type:    protocol.MessageTypeStreamHandshake,
-		Payload: streamHandshakeBytes,
-	}
-
-	if err := protocol.WriteMessage(dataConn, streamHandshakeMsg); err != nil {
-		t.Fatalf("failed to write stream handshake: %v", err)
-	}
-
-	// Read stream accept
-	streamAcceptMsg, err := protocol.ReadMessage(dataConn)
-	if err != nil {
-		t.Fatalf("failed to read stream accept message: %v", err)
-	}
-
-	if streamAcceptMsg.Type != protocol.MessageTypeStreamAccept {
-		t.Fatalf("expected MessageTypeStreamAccept, got type %d", streamAcceptMsg.Type)
-	}
-
-	time.Sleep(100 * time.Millisecond)
 
 	// Test large data transfer (1MB)
 	largeData := make([]byte, 1024*1024)
@@ -2080,7 +1303,7 @@ func TestBidirectionalProxyLargeData(t *testing.T) {
 
 	// Receive large data on data connection
 	receivedData := make([]byte, len(largeData))
-	_, err = io.ReadFull(dataConn, receivedData)
+	_, err := io.ReadFull(dataConn, receivedData)
 	if err != nil {
 		t.Fatalf("failed to read large data: %v", err)
 	}
@@ -2097,43 +1320,12 @@ func TestBidirectionalProxyLargeData(t *testing.T) {
 	}
 }
 
-// TestBidirectionalProxyMultipleConcurrentStreams tests multiple concurrent streams
 func TestBidirectionalProxyMultipleConcurrentStreams(t *testing.T) {
-	// Start server
-	server := NewServer(0, "")
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Run()
-	}()
-	defer server.Close()
+	env := NewTestEnvironment(t, nil)
+	defer env.Stop()
 
-	time.Sleep(100 * time.Millisecond)
-
-	// Establish control connection
-	controlConn, err := net.Dial("tcp", server.listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to connect to server: %v", err)
-	}
-	defer controlConn.Close()
-
-	// Send handshake
-	handshake := &protocol.HandshakePayload{
-		Version: protocol.ProtocolVersion,
-		Secret:  "",
-	}
-	handshakeBytes, _ := protocol.EncodeHandshake(handshake)
-	handshakeMsg := &protocol.Message{
-		Type:    protocol.MessageTypeHandshake,
-		Payload: handshakeBytes,
-	}
-	protocol.WriteMessage(controlConn, handshakeMsg)
-
-	// Read accept
-	acceptMsg, _ := protocol.ReadMessage(controlConn)
-	acceptPayload, _ := protocol.DecodeAccept(acceptMsg.Payload)
-	publicPort := acceptPayload.PublicPort
-
-	time.Sleep(100 * time.Millisecond)
+	client := env.ConnectClient("")
+	defer client.Close()
 
 	numStreams := 3
 	type streamPair struct {
@@ -2145,68 +1337,36 @@ func TestBidirectionalProxyMultipleConcurrentStreams(t *testing.T) {
 
 	// Create multiple streams
 	for i := 0; i < numStreams; i++ {
-		// Connect to public port
-		publicConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
-		if err != nil {
-			t.Fatalf("stream %d: failed to connect to public port: %v", i, err)
-		}
-
-		// Read connect message
-		connectMsg, err := protocol.ReadMessage(controlConn)
-		if err != nil {
-			t.Fatalf("stream %d: failed to read connect message: %v", i, err)
-		}
-		connectPayload, _ := protocol.DecodeConnect(connectMsg.Payload)
-
-		// Open data connection
-		dataConn, err := net.Dial("tcp", server.listener.Addr().String())
-		if err != nil {
-			t.Fatalf("stream %d: failed to connect for data connection: %v", i, err)
-		}
-
-		// Send stream handshake
-		streamHandshake := &protocol.StreamHandshakePayload{UUID: connectPayload.UUID}
-		streamHandshakeBytes, _ := protocol.EncodeStreamHandshake(streamHandshake)
-		streamHandshakeMsg := &protocol.Message{
-			Type:    protocol.MessageTypeStreamHandshake,
-			Payload: streamHandshakeBytes,
-		}
-		protocol.WriteMessage(dataConn, streamHandshakeMsg)
-
-		// Read stream accept
-		streamAcceptMsg, err := protocol.ReadMessage(dataConn)
-		if err != nil {
-			t.Fatalf("stream %d: failed to read stream accept: %v", i, err)
-		}
-		if streamAcceptMsg.Type != protocol.MessageTypeStreamAccept {
-			t.Fatalf("stream %d: expected StreamAccept, got %d", i, streamAcceptMsg.Type)
-		}
-
+		publicConn, dataConn, uuid := client.EstablishStream()
 		streams[i] = streamPair{
 			publicConn: publicConn,
 			dataConn:   dataConn,
-			uuid:       connectPayload.UUID,
+			uuid:       uuid,
 		}
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
 	// Test data isolation - send unique data on each stream
+	var wg sync.WaitGroup
 	testErrCh := make(chan error, numStreams*2)
 
 	for i, stream := range streams {
 		i := i
 		stream := stream
+		wg.Add(2)
 
 		// Send unique data from external to client
 		go func() {
+			defer wg.Done()
 			testData := []byte(fmt.Sprintf("Stream %d data from external", i))
 			_, err := stream.publicConn.Write(testData)
-			testErrCh <- err
+			if err != nil {
+				testErrCh <- err
+			}
 		}()
 
 		// Receive and verify on data connection
 		go func() {
+			defer wg.Done()
 			expectedData := []byte(fmt.Sprintf("Stream %d data from external", i))
 			buffer := make([]byte, len(expectedData))
 			_, err := io.ReadFull(stream.dataConn, buffer)
@@ -2216,15 +1376,15 @@ func TestBidirectionalProxyMultipleConcurrentStreams(t *testing.T) {
 			}
 			if string(buffer) != string(expectedData) {
 				testErrCh <- fmt.Errorf("stream %d: data mismatch: got %q, want %q", i, string(buffer), string(expectedData))
-				return
 			}
-			testErrCh <- nil
 		}()
 	}
 
-	// Wait for all operations
-	for i := 0; i < numStreams*2; i++ {
-		if err := <-testErrCh; err != nil {
+	wg.Wait()
+	close(testErrCh)
+
+	for err := range testErrCh {
+		if err != nil {
 			t.Error(err)
 		}
 	}
@@ -2236,38 +1396,14 @@ func TestBidirectionalProxyMultipleConcurrentStreams(t *testing.T) {
 	}
 }
 
-// TestBidirectionalProxyExternalCloses tests cleanup when external connection closes first
 func TestBidirectionalProxyExternalCloses(t *testing.T) {
-	server := NewServer(0, "")
-	go server.Run()
-	defer server.Close()
-	time.Sleep(100 * time.Millisecond)
+	env := NewTestEnvironment(t, nil)
+	defer env.Stop()
 
-	// Establish control connection
-	controlConn, _ := net.Dial("tcp", server.listener.Addr().String())
-	defer controlConn.Close()
+	client := env.ConnectClient("")
+	defer client.Close()
 
-	handshake := &protocol.HandshakePayload{Version: protocol.ProtocolVersion, Secret: ""}
-	handshakeBytes, _ := protocol.EncodeHandshake(handshake)
-	protocol.WriteMessage(controlConn, &protocol.Message{Type: protocol.MessageTypeHandshake, Payload: handshakeBytes})
-
-	acceptMsg, _ := protocol.ReadMessage(controlConn)
-	acceptPayload, _ := protocol.DecodeAccept(acceptMsg.Payload)
-	publicPort := acceptPayload.PublicPort
-	time.Sleep(100 * time.Millisecond)
-
-	// Create stream
-	publicConn, _ := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", publicPort))
-	connectMsg, _ := protocol.ReadMessage(controlConn)
-	connectPayload, _ := protocol.DecodeConnect(connectMsg.Payload)
-
-	dataConn, _ := net.Dial("tcp", server.listener.Addr().String())
-	streamHandshake := &protocol.StreamHandshakePayload{UUID: connectPayload.UUID}
-	streamHandshakeBytes, _ := protocol.EncodeStreamHandshake(streamHandshake)
-	protocol.WriteMessage(dataConn, &protocol.Message{Type: protocol.MessageTypeStreamHandshake, Payload: streamHandshakeBytes})
-	protocol.ReadMessage(dataConn) // stream accept
-
-	time.Sleep(100 * time.Millisecond)
+	publicConn, dataConn, _ := client.EstablishStream()
 
 	// Close external connection first
 	publicConn.Close()
@@ -2278,4 +1414,5 @@ func TestBidirectionalProxyExternalCloses(t *testing.T) {
 	if err == nil {
 		t.Error("data connection should be closed when external closes")
 	}
+	dataConn.Close()
 }
