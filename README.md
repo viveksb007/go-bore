@@ -1,5 +1,7 @@
 # gobore
 
+[![CI](https://github.com/viveksb007/go-bore/actions/workflows/ci.yml/badge.svg)](https://github.com/viveksb007/go-bore/actions/workflows/ci.yml)
+
 A TCP port tunneling tool written in Go, inspired by [bore](https://github.com/ekzhang/bore).
 
 `gobore` allows you to expose local ports to remote servers through secure tunneling. This is useful for sharing local development servers, testing webhooks, or accessing services behind NAT/firewalls.
