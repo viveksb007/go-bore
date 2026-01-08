@@ -21,6 +21,7 @@ type Server struct {
 	clientsMu      sync.RWMutex
 	portAllocator  *PortAllocator
 	listener       net.Listener
+	serverHost     string
 	pendingStreams map[string]*PendingStream
 	pendingMu      sync.RWMutex
 }
@@ -81,6 +82,11 @@ func (s *Server) Run() error {
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
 	s.listener = listener
+
+	// Extract server host once at startup
+	if host, _, err := net.SplitHostPort(listener.Addr().String()); err == nil && host != "" && host != "::" && host != "0.0.0.0" {
+		s.serverHost = host
+	}
 
 	logging.Info("server listening", "port", s.listenPort)
 
@@ -323,7 +329,7 @@ func (s *Server) authenticate(clientSecret string) bool {
 func (s *Server) sendAccept(conn net.Conn, publicPort int) error {
 	acceptPayload := &protocol.AcceptPayload{
 		PublicPort: uint16(publicPort),
-		ServerHost: "localhost", // TODO: Get actual server hostname
+		ServerHost: s.serverHost,
 	}
 
 	payloadBytes, err := protocol.EncodeAccept(acceptPayload)
