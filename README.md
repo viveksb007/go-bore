@@ -4,6 +4,10 @@ A TCP port tunneling tool written in Go, inspired by [bore](https://github.com/e
 
 `gobore` allows you to expose local ports to remote servers through secure tunneling. This is useful for sharing local development servers, testing webhooks, or accessing services behind NAT/firewalls.
 
+![Demo](assets/demo.gif)
+
+> **Note:** This demo was recorded by deploying the gobore server to a public EC2 instance. To test this yourself, you'll need to deploy the gobore server to a publicly accessible host.
+
 ## Installation
 
 ### From Source
