@@ -293,7 +293,6 @@ func TestSessionCleanup(t *testing.T) {
 	stream := &ServerStream{
 		uuid:         "test-uuid-1234",
 		externalConn: streamConn,
-		closeCh:      make(chan struct{}),
 		createdAt:    time.Now(),
 	}
 	session.streams["test-uuid-1234"] = stream

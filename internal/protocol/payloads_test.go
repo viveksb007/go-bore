@@ -112,31 +112,27 @@ func TestAcceptPayloadEncodeDecode(t *testing.T) {
 		payload *AcceptPayload
 	}{
 		{
-			name: "with hostname",
+			name: "standard port",
 			payload: &AcceptPayload{
 				PublicPort: 12345,
-				ServerHost: "example.com",
 			},
 		},
 		{
-			name: "with IP address",
+			name: "high port",
 			payload: &AcceptPayload{
 				PublicPort: 8080,
-				ServerHost: "192.168.1.1",
 			},
 		},
 		{
-			name: "with empty host",
+			name: "max port",
 			payload: &AcceptPayload{
-				PublicPort: 9999,
-				ServerHost: "",
+				PublicPort: 65535,
 			},
 		},
 		{
-			name: "with long hostname",
+			name: "low port",
 			payload: &AcceptPayload{
 				PublicPort: 443,
-				ServerHost: "very-long-subdomain.example.com",
 			},
 		},
 	}
@@ -159,10 +155,6 @@ func TestAcceptPayloadEncodeDecode(t *testing.T) {
 			if decoded.PublicPort != tt.payload.PublicPort {
 				t.Errorf("PublicPort mismatch: got %d, want %d", decoded.PublicPort, tt.payload.PublicPort)
 			}
-
-			if decoded.ServerHost != tt.payload.ServerHost {
-				t.Errorf("ServerHost mismatch: got %q, want %q", decoded.ServerHost, tt.payload.ServerHost)
-			}
 		})
 	}
 }
@@ -177,12 +169,8 @@ func TestDecodeAcceptTooShort(t *testing.T) {
 			data: []byte{},
 		},
 		{
-			name: "only port",
-			data: []byte{0, 80},
-		},
-		{
-			name: "port and partial length",
-			data: []byte{0, 80, 0},
+			name: "only one byte",
+			data: []byte{0},
 		},
 	}
 
@@ -197,20 +185,6 @@ func TestDecodeAcceptTooShort(t *testing.T) {
 				t.Errorf("Expected 'too short' error, got: %v", err)
 			}
 		})
-	}
-}
-
-func TestDecodeAcceptInvalidLength(t *testing.T) {
-	// Port=8080, HostLen=10, but only 5 bytes of host
-	data := []byte{0x1F, 0x90, 0, 10, 'a', 'b', 'c', 'd', 'e'}
-
-	_, err := DecodeAccept(data)
-	if err == nil {
-		t.Fatal("Expected error for invalid length, got nil")
-	}
-
-	if !strings.Contains(err.Error(), "invalid accept payload") {
-		t.Errorf("Expected 'invalid accept payload' error, got: %v", err)
 	}
 }
 
@@ -241,7 +215,6 @@ func TestHandshakePayloadRoundTrip(t *testing.T) {
 func TestAcceptPayloadRoundTrip(t *testing.T) {
 	original := &AcceptPayload{
 		PublicPort: 54321,
-		ServerHost: "tunnel.example.com",
 	}
 
 	// Encode
@@ -257,7 +230,7 @@ func TestAcceptPayloadRoundTrip(t *testing.T) {
 	}
 
 	// Verify exact match
-	if decoded.PublicPort != original.PublicPort || decoded.ServerHost != original.ServerHost {
+	if decoded.PublicPort != original.PublicPort {
 		t.Errorf("Round trip failed: got %+v, want %+v", decoded, original)
 	}
 }

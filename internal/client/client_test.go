@@ -79,7 +79,6 @@ func TestClientConnectSuccess(t *testing.T) {
 
 	serverAddr := listener.Addr().String()
 	expectedPort := uint16(12345)
-	expectedHost := "test-server.example.com"
 
 	// Handle server side in goroutine
 	serverDone := make(chan error, 1)
@@ -123,7 +122,6 @@ func TestClientConnectSuccess(t *testing.T) {
 		// Send accept message
 		acceptPayload := &protocol.AcceptPayload{
 			PublicPort: expectedPort,
-			ServerHost: expectedHost,
 		}
 		payloadBytes, _ := protocol.EncodeAccept(acceptPayload)
 		acceptMsg := &protocol.Message{
@@ -156,9 +154,6 @@ func TestClientConnectSuccess(t *testing.T) {
 	// Verify client state
 	if client.PublicPort() != expectedPort {
 		t.Errorf("PublicPort() = %v, want %v", client.PublicPort(), expectedPort)
-	}
-	if client.ServerHost() != expectedHost {
-		t.Errorf("ServerHost() = %v, want %v", client.ServerHost(), expectedHost)
 	}
 	if client.controlConn == nil {
 		t.Error("controlConn should not be nil after successful Connect()")
@@ -248,7 +243,6 @@ func TestClientClose(t *testing.T) {
 		// Send accept message
 		acceptPayload := &protocol.AcceptPayload{
 			PublicPort: 12345,
-			ServerHost: "localhost",
 		}
 		payloadBytes, _ := protocol.EncodeAccept(acceptPayload)
 		acceptMsg := &protocol.Message{
@@ -319,7 +313,6 @@ func TestClientConnectNoSecret(t *testing.T) {
 		// Send accept message
 		acceptPayload := &protocol.AcceptPayload{
 			PublicPort: 54321,
-			ServerHost: "open-server",
 		}
 		payloadBytes, _ := protocol.EncodeAccept(acceptPayload)
 		acceptMsg := &protocol.Message{
@@ -346,28 +339,24 @@ func TestClientPublicURL(t *testing.T) {
 	tests := []struct {
 		name       string
 		serverAddr string
-		serverHost string
 		publicPort uint16
 		wantURL    string
 	}{
 		{
-			name:       "with server host from accept message",
+			name:       "with hostname server address",
 			serverAddr: "example.com:7835",
-			serverHost: "tunnel.example.com",
 			publicPort: 12345,
-			wantURL:    "tunnel.example.com:12345",
+			wantURL:    "example.com:12345",
 		},
 		{
-			name:       "with empty server host uses server address",
+			name:       "with different port",
 			serverAddr: "example.com:7835",
-			serverHost: "",
 			publicPort: 54321,
 			wantURL:    "example.com:54321",
 		},
 		{
 			name:       "with IP address",
 			serverAddr: "192.168.1.100:7835",
-			serverHost: "",
 			publicPort: 8080,
 			wantURL:    "192.168.1.100:8080",
 		},
@@ -376,7 +365,6 @@ func TestClientPublicURL(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := NewClient(tt.serverAddr, 3000, "localhost", "")
-			client.serverHost = tt.serverHost
 			client.publicPort = tt.publicPort
 
 			if got := client.PublicURL(); got != tt.wantURL {
@@ -573,7 +561,6 @@ func TestClientRunHandlesConnectMessage(t *testing.T) {
 		// Send accept message
 		acceptPayload := &protocol.AcceptPayload{
 			PublicPort: 12345,
-			ServerHost: "localhost",
 		}
 		payloadBytes, _ := protocol.EncodeAccept(acceptPayload)
 		acceptMsg := &protocol.Message{
@@ -708,7 +695,6 @@ func TestClientRunHandlesMultipleConnectMessages(t *testing.T) {
 		// Send accept message
 		acceptPayload := &protocol.AcceptPayload{
 			PublicPort: 12345,
-			ServerHost: "localhost",
 		}
 		payloadBytes, _ := protocol.EncodeAccept(acceptPayload)
 		acceptMsg := &protocol.Message{
@@ -836,7 +822,6 @@ func TestClientRunHandlesUnexpectedMessageType(t *testing.T) {
 		// Send accept message
 		acceptPayload := &protocol.AcceptPayload{
 			PublicPort: 12345,
-			ServerHost: "localhost",
 		}
 		payloadBytes, _ := protocol.EncodeAccept(acceptPayload)
 		acceptMsg := &protocol.Message{
@@ -911,7 +896,6 @@ func TestClientRunHandlesMalformedConnectPayload(t *testing.T) {
 		// Send accept message
 		acceptPayload := &protocol.AcceptPayload{
 			PublicPort: 12345,
-			ServerHost: "localhost",
 		}
 		payloadBytes, _ := protocol.EncodeAccept(acceptPayload)
 		acceptMsg := &protocol.Message{
@@ -986,7 +970,6 @@ func TestClientRunGracefulShutdown(t *testing.T) {
 		// Send accept message
 		acceptPayload := &protocol.AcceptPayload{
 			PublicPort: 12345,
-			ServerHost: "localhost",
 		}
 		payloadBytes, _ := protocol.EncodeAccept(acceptPayload)
 		acceptMsg := &protocol.Message{
@@ -1046,8 +1029,8 @@ func TestClientStreamCount(t *testing.T) {
 
 	// Manually add streams for testing
 	client.streamsMu.Lock()
-	client.streams["uuid1"] = &ClientStream{uuid: "uuid1", closeCh: make(chan struct{})}
-	client.streams["uuid2"] = &ClientStream{uuid: "uuid2", closeCh: make(chan struct{})}
+	client.streams["uuid1"] = &ClientStream{uuid: "uuid1"}
+	client.streams["uuid2"] = &ClientStream{uuid: "uuid2"}
 	client.streamsMu.Unlock()
 
 	if client.StreamCount() != 2 {
@@ -1061,8 +1044,7 @@ func TestClientRemoveStream(t *testing.T) {
 	// Add a stream
 	client.streamsMu.Lock()
 	client.streams["test-uuid"] = &ClientStream{
-		uuid:    "test-uuid",
-		closeCh: make(chan struct{}),
+		uuid: "test-uuid",
 	}
 	client.streamsMu.Unlock()
 
@@ -1117,7 +1099,7 @@ func TestClientStreamHandshakeSuccess(t *testing.T) {
 
 		// Read handshake and send accept
 		protocol.ReadMessage(controlConn)
-		acceptPayload := &protocol.AcceptPayload{PublicPort: 12345, ServerHost: "localhost"}
+		acceptPayload := &protocol.AcceptPayload{PublicPort: 12345}
 		payloadBytes, _ := protocol.EncodeAccept(acceptPayload)
 		protocol.WriteMessage(controlConn, &protocol.Message{Type: protocol.MessageTypeAccept, Payload: payloadBytes})
 
@@ -1231,7 +1213,7 @@ func TestClientStreamHandshakeRejected(t *testing.T) {
 
 		// Read handshake and send accept
 		protocol.ReadMessage(controlConn)
-		acceptPayload := &protocol.AcceptPayload{PublicPort: 12345, ServerHost: "localhost"}
+		acceptPayload := &protocol.AcceptPayload{PublicPort: 12345}
 		payloadBytes, _ := protocol.EncodeAccept(acceptPayload)
 		protocol.WriteMessage(controlConn, &protocol.Message{Type: protocol.MessageTypeAccept, Payload: payloadBytes})
 
@@ -1314,7 +1296,7 @@ func TestClientStreamDataConnectionFailed(t *testing.T) {
 
 		// Read handshake and send accept
 		protocol.ReadMessage(controlConn)
-		acceptPayload := &protocol.AcceptPayload{PublicPort: 12345, ServerHost: "localhost"}
+		acceptPayload := &protocol.AcceptPayload{PublicPort: 12345}
 		payloadBytes, _ := protocol.EncodeAccept(acceptPayload)
 		protocol.WriteMessage(controlConn, &protocol.Message{Type: protocol.MessageTypeAccept, Payload: payloadBytes})
 
@@ -1390,7 +1372,7 @@ func TestClientStreamLocalServiceUnavailable(t *testing.T) {
 
 		// Read handshake and send accept
 		protocol.ReadMessage(controlConn)
-		acceptPayload := &protocol.AcceptPayload{PublicPort: 12345, ServerHost: "localhost"}
+		acceptPayload := &protocol.AcceptPayload{PublicPort: 12345}
 		payloadBytes, _ := protocol.EncodeAccept(acceptPayload)
 		protocol.WriteMessage(controlConn, &protocol.Message{Type: protocol.MessageTypeAccept, Payload: payloadBytes})
 
@@ -1495,7 +1477,7 @@ func TestClientBidirectionalProxy(t *testing.T) {
 
 		// Read handshake and send accept
 		protocol.ReadMessage(controlConn)
-		acceptPayload := &protocol.AcceptPayload{PublicPort: 12345, ServerHost: "localhost"}
+		acceptPayload := &protocol.AcceptPayload{PublicPort: 12345}
 		payloadBytes, _ := protocol.EncodeAccept(acceptPayload)
 		protocol.WriteMessage(controlConn, &protocol.Message{Type: protocol.MessageTypeAccept, Payload: payloadBytes})
 
@@ -1674,7 +1656,7 @@ func TestClientProxyCleanupOnDataConnClose(t *testing.T) {
 
 		// Read handshake and send accept
 		protocol.ReadMessage(controlConn)
-		acceptPayload := &protocol.AcceptPayload{PublicPort: 12345, ServerHost: "localhost"}
+		acceptPayload := &protocol.AcceptPayload{PublicPort: 12345}
 		payloadBytes, _ := protocol.EncodeAccept(acceptPayload)
 		protocol.WriteMessage(controlConn, &protocol.Message{Type: protocol.MessageTypeAccept, Payload: payloadBytes})
 
@@ -1785,7 +1767,7 @@ func TestClientProxyCleanupOnLocalConnClose(t *testing.T) {
 
 		// Read handshake and send accept
 		protocol.ReadMessage(controlConn)
-		acceptPayload := &protocol.AcceptPayload{PublicPort: 12345, ServerHost: "localhost"}
+		acceptPayload := &protocol.AcceptPayload{PublicPort: 12345}
 		payloadBytes, _ := protocol.EncodeAccept(acceptPayload)
 		protocol.WriteMessage(controlConn, &protocol.Message{Type: protocol.MessageTypeAccept, Payload: payloadBytes})
 

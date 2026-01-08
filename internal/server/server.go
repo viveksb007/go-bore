@@ -21,7 +21,6 @@ type Server struct {
 	clientsMu      sync.RWMutex
 	portAllocator  *PortAllocator
 	listener       net.Listener
-	serverHost     string
 	pendingStreams map[string]*PendingStream
 	pendingMu      sync.RWMutex
 }
@@ -41,7 +40,6 @@ type ServerStream struct {
 	uuid         string
 	dataConn     net.Conn
 	externalConn net.Conn
-	closeCh      chan struct{}
 	createdAt    time.Time
 }
 
@@ -82,11 +80,6 @@ func (s *Server) Run() error {
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
 	s.listener = listener
-
-	// Extract server host once at startup
-	if host, _, err := net.SplitHostPort(listener.Addr().String()); err == nil && host != "" && host != "::" && host != "0.0.0.0" {
-		s.serverHost = host
-	}
 
 	logging.Info("server listening", "port", s.listenPort)
 
@@ -295,7 +288,6 @@ func (s *Server) handleDataConnection(conn net.Conn, streamHandshakeMsg *protoco
 		uuid:         uuid,
 		dataConn:     conn,
 		externalConn: pending.externalConn,
-		closeCh:      make(chan struct{}),
 		createdAt:    time.Now(),
 	}
 
@@ -329,7 +321,6 @@ func (s *Server) authenticate(clientSecret string) bool {
 func (s *Server) sendAccept(conn net.Conn, publicPort int) error {
 	acceptPayload := &protocol.AcceptPayload{
 		PublicPort: uint16(publicPort),
-		ServerHost: s.serverHost,
 	}
 
 	payloadBytes, err := protocol.EncodeAccept(acceptPayload)
@@ -445,13 +436,6 @@ func (s *ServerStream) close() {
 	}
 	if s.externalConn != nil {
 		s.externalConn.Close()
-	}
-	// Close channel only once using select to avoid panic
-	select {
-	case <-s.closeCh:
-		// Already closed
-	default:
-		close(s.closeCh)
 	}
 }
 

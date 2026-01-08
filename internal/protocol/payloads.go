@@ -61,53 +61,23 @@ func DecodeHandshake(data []byte) (*HandshakePayload, error) {
 // AcceptPayload represents the accept message payload
 type AcceptPayload struct {
 	PublicPort uint16
-	ServerHost string
 }
 
 // EncodeAccept encodes an accept payload
 func EncodeAccept(payload *AcceptPayload) ([]byte, error) {
-	hostBytes := []byte(payload.ServerHost)
-	hostLen := uint16(len(hostBytes))
-
-	// Calculate total size: publicPort(2) + hostLen(2) + host(variable)
-	buf := make([]byte, 2+2+len(hostBytes))
-
-	// Write public port
+	buf := make([]byte, 2)
 	binary.BigEndian.PutUint16(buf[0:2], payload.PublicPort)
-
-	// Write host length
-	binary.BigEndian.PutUint16(buf[2:4], hostLen)
-
-	// Write host
-	copy(buf[4:], hostBytes)
-
 	return buf, nil
 }
 
 // DecodeAccept decodes an accept payload
 func DecodeAccept(data []byte) (*AcceptPayload, error) {
-	if len(data) < 4 {
+	if len(data) < 2 {
 		return nil, fmt.Errorf("accept payload too short: %d bytes", len(data))
 	}
 
 	payload := &AcceptPayload{}
-
-	// Read public port
 	payload.PublicPort = binary.BigEndian.Uint16(data[0:2])
-
-	// Read host length
-	hostLen := binary.BigEndian.Uint16(data[2:4])
-
-	// Validate length
-	if len(data) < 4+int(hostLen) {
-		return nil, fmt.Errorf("invalid accept payload: expected %d bytes, got %d", 4+hostLen, len(data))
-	}
-
-	// Read host
-	if hostLen > 0 {
-		payload.ServerHost = string(data[4 : 4+hostLen])
-	}
-
 	return payload, nil
 }
 

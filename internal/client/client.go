@@ -23,7 +23,6 @@ type Client struct {
 	secret      string                   // Authentication secret
 	controlConn net.Conn                 // Control connection to server (persistent)
 	publicPort  uint16                   // Public port allocated by server
-	serverHost  string                   // Server hostname from accept message
 	streams     map[string]*ClientStream // Active proxied connections (UUID -> ClientStream)
 	streamsMu   sync.RWMutex             // Protects streams map
 	ctx         context.Context          // Context for cancellation
@@ -34,10 +33,9 @@ type Client struct {
 // ClientStream represents a proxied connection on the client side
 type ClientStream struct {
 	uuid      string
-	dataConn  net.Conn      // Data connection to server
-	localConn net.Conn      // Connection to local service
-	closeCh   chan struct{} // Signal for cleanup
-	createdAt time.Time     // For monitoring/debugging
+	dataConn  net.Conn  // Data connection to server
+	localConn net.Conn  // Connection to local service
+	createdAt time.Time // For monitoring/debugging
 }
 
 // NewClient creates a new Client instance with the specified configuration
@@ -167,11 +165,7 @@ func (c *Client) receiveHandshakeResponse() error {
 			return NewProtocolError("decode_accept", fmt.Sprintf("malformed accept message: %v", err))
 		}
 		c.publicPort = acceptPayload.PublicPort
-		c.serverHost = acceptPayload.ServerHost
-		logging.Debug("handshake accepted",
-			"publicPort", c.publicPort,
-			"serverHost", c.serverHost,
-		)
+		logging.Debug("handshake accepted", "publicPort", c.publicPort)
 		return nil
 
 	case protocol.MessageTypeReject:
@@ -260,7 +254,6 @@ func (c *Client) handleNewStream(uuid string) {
 	// Create stream entry to track this connection
 	stream := &ClientStream{
 		uuid:      uuid,
-		closeCh:   make(chan struct{}),
 		createdAt: time.Now(),
 	}
 
@@ -382,17 +375,8 @@ func (c *Client) PublicPort() uint16 {
 	return c.publicPort
 }
 
-// ServerHost returns the server hostname from the accept message
-func (c *Client) ServerHost() string {
-	return c.serverHost
-}
-
 // PublicURL returns the public URL where the tunneled service is accessible
 func (c *Client) PublicURL() string {
-	if c.serverHost != "" {
-		return fmt.Sprintf("%s:%d", c.serverHost, c.publicPort)
-	}
-	// Extract host from server address if serverHost is empty
 	host, _, err := net.SplitHostPort(c.serverAddr)
 	if err != nil {
 		return fmt.Sprintf("localhost:%d", c.publicPort)
@@ -452,13 +436,6 @@ func (s *ClientStream) close() {
 	}
 	if s.localConn != nil {
 		s.localConn.Close()
-	}
-	// Close channel only once using select to avoid panic
-	select {
-	case <-s.closeCh:
-		// Already closed
-	default:
-		close(s.closeCh)
 	}
 }
 
