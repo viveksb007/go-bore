@@ -550,7 +550,7 @@ func TestHandshakeAuthenticationFailure(t *testing.T) {
 
 func TestHandshakeOpenMode(t *testing.T) {
 	// Start server without secret (open mode)
-	server := NewServer(0, "")
+	server := NewServer(18551, "")
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- server.Run()
@@ -559,6 +559,11 @@ func TestHandshakeOpenMode(t *testing.T) {
 
 	// Give server time to start
 	time.Sleep(100 * time.Millisecond)
+
+	// Verify server started successfully
+	if server.listener == nil {
+		t.Fatal("server listener is nil - server failed to start")
+	}
 
 	// Connect as client
 	conn, err := net.Dial("tcp", server.listener.Addr().String())
