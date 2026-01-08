@@ -66,7 +66,7 @@ func TestNewServer(t *testing.T) {
 }
 
 func TestServerRun(t *testing.T) {
-	server := NewServer(0, "")
+	server := NewServer(18001, "")
 
 	// Start server in a goroutine
 	errCh := make(chan error, 1)
@@ -99,8 +99,8 @@ func TestServerRun(t *testing.T) {
 }
 
 func TestServerRunPortInUse(t *testing.T) {
-	// Start first server on a random port
-	server1 := NewServer(0, "")
+	// Start first server on a specific port
+	server1 := NewServer(18002, "")
 	errCh1 := make(chan error, 1)
 	go func() {
 		errCh1 <- server1.Run()
@@ -420,7 +420,7 @@ func TestAuthenticate(t *testing.T) {
 
 func TestHandshakeSuccess(t *testing.T) {
 	// Start server
-	server := NewServer(0, "test-secret")
+	server := NewServer(18003, "test-secret")
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- server.Run()
@@ -490,7 +490,7 @@ func TestHandshakeSuccess(t *testing.T) {
 
 func TestHandshakeAuthenticationFailure(t *testing.T) {
 	// Start server with secret
-	server := NewServer(0, "correct-secret")
+	server := NewServer(18004, "correct-secret")
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- server.Run()
@@ -730,10 +730,10 @@ func TestCreatePublicListener(t *testing.T) {
 }
 
 func TestCreatePublicListenerPortInUse(t *testing.T) {
-	server := NewServer(0, "")
+	server := NewServer(18005, "")
 
-	// Create a listener on a specific port
-	existingListener, err := net.Listen("tcp", "127.0.0.1:0")
+	// Create a listener on a specific port (all interfaces to match createPublicListener)
+	existingListener, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatalf("failed to create existing listener: %v", err)
 	}
