@@ -28,7 +28,7 @@ archives:
       - goos: windows
         formats:
           - zip
-    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    name_template: "gobore_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
 checksum:
   name_template: 'checksums.txt'
@@ -42,7 +42,8 @@ changelog:
       - '^chore:'
 
 brews:
-  - repository:
+  - name: gobore
+    repository:
       owner: viveksb007
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
