@@ -12,6 +12,13 @@ A TCP port tunneling tool written in Go, inspired by [bore](https://github.com/e
 
 ## Installation
 
+### Homebrew (macOS/Linux)
+
+```bash
+brew tap viveksb007/tap
+brew install gobore
+```
+
 ### From Source
 
 ```bash
